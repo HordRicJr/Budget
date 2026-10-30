@@ -1,0 +1,3774 @@
+# Snapshot synthétique des fichiers concernés — VCS indisponible; lignes courantes présentées comme ajouts.
+
+diff --git a/db/migrations/002_financial_planning.sql b/db/migrations/002_financial_planning.sql
+new file mode 100644
+--- /dev/null
++++ b/db/migrations/002_financial_planning.sql
+@@ -0,0 +1,120 @@
++CREATE TABLE financial_item (
++  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++  owner_id uuid NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
++  kind text NOT NULL CHECK (kind IN ('debt', 'subscription', 'project', 'custom')),
++  name text NOT NULL CHECK (length(trim(name)) BETWEEN 1 AND 120),
++  target_amount_xof bigint CHECK (target_amount_xof IS NULL OR target_amount_xof > 0),
++  remaining_amount_xof bigint CHECK (remaining_amount_xof IS NULL OR remaining_amount_xof >= 0),
++  planned_amount_xof bigint NOT NULL CHECK (planned_amount_xof >= 0),
++  due_on date,
++  cadence text CHECK (cadence IS NULL OR cadence IN ('once', 'weekly', 'monthly', 'yearly')),
++  priority smallint NOT NULL DEFAULT 3 CHECK (priority BETWEEN 1 AND 5),
++  deferral_impact text NOT NULL DEFAULT '' CHECK (length(deferral_impact) <= 500),
++  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused', 'completed', 'cancelled')),
++  version integer NOT NULL DEFAULT 1 CHECK (version > 0),
++  created_at timestamptz NOT NULL DEFAULT now(),
++  updated_at timestamptz NOT NULL DEFAULT now(),
++  UNIQUE (id, owner_id),
++  CHECK (target_amount_xof IS NULL OR remaining_amount_xof IS NULL OR remaining_amount_xof <= target_amount_xof)
++);
++
++CREATE INDEX financial_item_owner_kind_status_idx
++  ON financial_item (owner_id, kind, status);
++CREATE INDEX financial_item_owner_due_idx
++  ON financial_item (owner_id, status, due_on);
++
++ALTER TABLE financial_transaction
++  ADD COLUMN financial_item_id uuid;
++
++ALTER TABLE financial_transaction
++  ADD CONSTRAINT financial_transaction_item_owner_fk
++  FOREIGN KEY (financial_item_id, owner_id)
++  REFERENCES financial_item (id, owner_id) ON DELETE RESTRICT;
++
++CREATE INDEX financial_transaction_item_idx
++  ON financial_transaction (owner_id, financial_item_id)
++  WHERE financial_item_id IS NOT NULL;
++
++CREATE TABLE unexpected_event (
++  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++  owner_id uuid NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
++  title text NOT NULL CHECK (length(trim(title)) BETWEEN 1 AND 120),
++  amount_xof bigint NOT NULL CHECK (amount_xof > 0),
++  occurred_on date NOT NULL,
++  due_on date,
++  urgency smallint NOT NULL DEFAULT 3 CHECK (urgency BETWEEN 1 AND 5),
++  note text NOT NULL DEFAULT '' CHECK (length(note) <= 500),
++  status text NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'planned', 'resolved')),
++  version integer NOT NULL DEFAULT 1 CHECK (version > 0),
++  created_at timestamptz NOT NULL DEFAULT now(),
++  updated_at timestamptz NOT NULL DEFAULT now(),
++  UNIQUE (id, owner_id)
++);
++
++CREATE INDEX unexpected_event_owner_status_due_idx
++  ON unexpected_event (owner_id, status, due_on);
++
++CREATE TABLE scenario (
++  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++  owner_id uuid NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
++  name text NOT NULL CHECK (length(trim(name)) BETWEEN 1 AND 120),
++  budget_month date NOT NULL,
++  event_id uuid NOT NULL,
++  status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'applied')),
++  data_version text NOT NULL,
++  result jsonb NOT NULL,
++  version integer NOT NULL DEFAULT 1 CHECK (version > 0),
++  created_at timestamptz NOT NULL DEFAULT now(),
++  applied_at timestamptz,
++  UNIQUE (id, owner_id),
++  FOREIGN KEY (event_id, owner_id) REFERENCES unexpected_event (id, owner_id) ON DELETE RESTRICT
++);
++
++CREATE INDEX scenario_owner_month_idx ON scenario (owner_id, budget_month DESC);
++
++CREATE TABLE scenario_action (
++  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++  owner_id uuid NOT NULL,
++  scenario_id uuid NOT NULL,
++  financial_item_id uuid,
++  action text NOT NULL CHECK (action IN ('reduce', 'defer', 'pause', 'allocate')),
++  amount_delta_xof bigint NOT NULL DEFAULT 0,
++  consequence text NOT NULL CHECK (length(consequence) <= 500),
++  FOREIGN KEY (scenario_id, owner_id) REFERENCES scenario (id, owner_id) ON DELETE CASCADE,
++  FOREIGN KEY (financial_item_id, owner_id) REFERENCES financial_item (id, owner_id) ON DELETE RESTRICT
++);
++
++CREATE INDEX scenario_action_scenario_idx ON scenario_action (owner_id, scenario_id);
++
++CREATE TABLE idempotency_record (
++  owner_id uuid NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
++  operation text NOT NULL,
++  idempotency_key text NOT NULL CHECK (length(idempotency_key) BETWEEN 8 AND 128),
++  request_hash text NOT NULL CHECK (length(request_hash) = 64),
++  response jsonb NOT NULL,
++  created_at timestamptz NOT NULL DEFAULT now(),
++  PRIMARY KEY (owner_id, operation, idempotency_key)
++);
++
++CREATE TABLE recommendation (
++  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++  owner_id uuid NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
++  scenario_id uuid,
++  input_snapshot jsonb NOT NULL,
++  result jsonb NOT NULL,
++  provider text NOT NULL CHECK (provider IN ('rules', 'groq')),
++  model text,
++  schema_version smallint NOT NULL DEFAULT 1 CHECK (schema_version = 1),
++  prompt_version smallint NOT NULL DEFAULT 1 CHECK (prompt_version = 1),
++  candidate_hash text NOT NULL CHECK (length(candidate_hash) = 64),
++  created_at timestamptz NOT NULL DEFAULT now(),
++  FOREIGN KEY (scenario_id, owner_id) REFERENCES scenario (id, owner_id) ON DELETE SET NULL (scenario_id)
++);
++
++CREATE INDEX recommendation_owner_created_idx ON recommendation (owner_id, created_at DESC);
++
++CREATE TABLE groq_request_throttle (
++  owner_id uuid PRIMARY KEY REFERENCES app_user(id) ON DELETE CASCADE,
++  window_started_at timestamptz NOT NULL DEFAULT now(),
++  request_count integer NOT NULL DEFAULT 1 CHECK (request_count > 0)
++);
+
+diff --git a/server/domain/obligations.js b/server/domain/obligations.js
+new file mode 100644
+--- /dev/null
++++ b/server/domain/obligations.js
+@@ -0,0 +1,74 @@
++import { isValidDate } from './transactions.js';
++
++const kinds = new Set(['debt', 'subscription', 'project', 'custom']);
++const cadences = new Set(['once', 'weekly', 'monthly', 'yearly']);
++const statuses = new Set(['active', 'paused', 'completed', 'cancelled']);
++
++export function validateFinancialItem(input, { partial = false } = {}) {
++  if (!input || typeof input !== 'object' || Array.isArray(input)) return invalid('Les données de l’engagement sont invalides.');
++  const required = ['kind', 'name', 'plannedAmountXof', 'priority'];
++  if (!partial && required.some((key) => !(key in input))) return invalid('Complétez les champs requis de l’engagement.');
++  const result = {};
++
++  if ('kind' in input) {
++    if (!kinds.has(input.kind)) return invalid('Choisissez un type d’engagement valide.');
++    result.kind = input.kind;
++  }
++  if ('name' in input) {
++    if (typeof input.name !== 'string' || input.name.trim().length < 1 || input.name.trim().length > 120) {
++      return invalid('Le nom doit contenir de 1 à 120 caractères.');
++    }
++    result.name = input.name.trim();
++  }
++  for (const [key, output] of [
++    ['targetAmountXof', 'targetAmountXof'],
++    ['remainingAmountXof', 'remainingAmountXof'],
++    ['plannedAmountXof', 'plannedAmountXof'],
++  ]) {
++    if (!(key in input)) continue;
++    const value = input[key];
++    const minimum = key === 'targetAmountXof' ? 1 : 0;
++    if (value !== null && (!Number.isSafeInteger(value) || value < minimum)) {
++      return invalid(key === 'targetAmountXof'
++        ? 'Le montant total doit être un nombre entier positif en XOF.'
++        : 'Les montants doivent être des nombres entiers XOF positifs ou nuls.');
++    }
++    result[output] = value;
++  }
++  if ('priority' in input) {
++    if (!Number.isInteger(input.priority) || input.priority < 1 || input.priority > 5) return invalid('La priorité doit être comprise entre 1 et 5.');
++    result.priority = input.priority;
++  }
++  if ('dueOn' in input) {
++    if (input.dueOn !== null && input.dueOn !== '' && !isValidDate(input.dueOn)) return invalid('Saisissez une échéance valide.');
++    result.dueOn = input.dueOn || null;
++  }
++  if ('cadence' in input) {
++    if (input.cadence !== null && !cadences.has(input.cadence)) return invalid('Choisissez une périodicité valide.');
++    result.cadence = input.cadence;
++  }
++  if ('deferralImpact' in input) {
++    if (typeof input.deferralImpact !== 'string' || input.deferralImpact.length > 500) return invalid('La conséquence du report ne peut pas dépasser 500 caractères.');
++    result.deferralImpact = input.deferralImpact.trim();
++  }
++  if ('status' in input) {
++    if (!statuses.has(input.status)) return invalid('Choisissez un statut valide.');
++    result.status = input.status;
++  }
++  if (result.targetAmountXof != null && result.remainingAmountXof != null && result.remainingAmountXof > result.targetAmountXof) {
++    return invalid('Le solde restant ne peut pas dépasser le montant total.');
++  }
++  return { ok: true, value: result };
++}
++
++function invalid(message) {
++  return { ok: false, message };
++}
++
++export function rankObligations(items) {
++  return [...items].sort((a, b) =>
++    Number(b.priority) - Number(a.priority)
++    || (a.dueOn ?? '9999-12-31').localeCompare(b.dueOn ?? '9999-12-31')
++    || a.name.localeCompare(b.name, 'fr'),
++  );
++}
+
+diff --git a/server/domain/obligations.test.js b/server/domain/obligations.test.js
+new file mode 100644
+--- /dev/null
++++ b/server/domain/obligations.test.js
+@@ -0,0 +1,41 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { rankObligations, validateFinancialItem } from './obligations.js';
++
++const valid = {
++  kind: 'debt',
++  name: 'Moto',
++  plannedAmountXof: 15000,
++  remainingAmountXof: 100000,
++  targetAmountXof: 200000,
++  dueOn: '2026-11-15',
++  cadence: 'monthly',
++  priority: 4,
++  deferralImpact: 'Pénalité après échéance',
++};
++
++test('valide un engagement et conserve ses champs significatifs', () => {
++  const result = validateFinancialItem(valid);
++  assert.equal(result.ok, true);
++  assert.equal(result.value.name, 'Moto');
++  assert.equal(result.value.plannedAmountXof, 15000);
++  assert.equal(result.value.dueOn, '2026-11-15');
++});
++
++test('rejette un type, montant, priorité ou échéance invalide', () => {
++  assert.equal(validateFinancialItem({ ...valid, kind: 'loan' }).ok, false);
++  assert.equal(validateFinancialItem({ ...valid, plannedAmountXof: 1.5 }).ok, false);
++  assert.equal(validateFinancialItem({ ...valid, targetAmountXof: 0 }).ok, false);
++  assert.equal(validateFinancialItem({ ...valid, priority: 6 }).ok, false);
++  assert.equal(validateFinancialItem({ ...valid, dueOn: '2026-02-30' }).ok, false);
++  assert.equal(validateFinancialItem({ ...valid, remainingAmountXof: 300000 }).ok, false);
++});
++
++test('classe les engagements par priorité, échéance puis libellé de façon stable', () => {
++  const result = rankObligations([
++    { id: 'later', priority: 3, dueOn: '2026-12-01', name: 'Z' },
++    { id: 'urgent', priority: 4, dueOn: '2026-12-31', name: 'B' },
++    { id: 'first', priority: 3, dueOn: '2026-11-01', name: 'C' },
++  ]);
++  assert.deepEqual(result.map((item) => item.id), ['urgent', 'first', 'later']);
++});
+
+diff --git a/server/domain/scenarios.js b/server/domain/scenarios.js
+new file mode 100644
+--- /dev/null
++++ b/server/domain/scenarios.js
+@@ -0,0 +1,127 @@
++import { createHash } from 'node:crypto';
++
++const safeInteger = (value) => Number.isSafeInteger(Number(value));
++
++export function buildScenario(event, summary, items, month) {
++  if (!event || !summary || !Array.isArray(items) || !/^\d{4}-\d{2}$/.test(month)) {
++    throw new TypeError('Contexte de simulation invalide.');
++  }
++  const total = BigInt(summary.incomeXof) - BigInt(summary.expensesXof) - BigInt(summary.plannedXof);
++  if (total > BigInt(Number.MAX_SAFE_INTEGER) || total < BigInt(Number.MIN_SAFE_INTEGER)) {
++    throw new RangeError('Le solde dépasse la précision prise en charge.');
++  }
++  const availableXof = Number(total);
++  const activeItems = items.filter((item) => item.status === 'active')
++    .map((item) => ({ ...item, plannedAmountXof: Number(item.plannedAmountXof) }))
++    .filter((item) => Number.isSafeInteger(item.plannedAmountXof) && item.plannedAmountXof > 0);
++
++  const candidateActions = activeItems.flatMap((item) => {
++    const release = Math.min(item.plannedAmountXof, Number(event.amountXof));
++    const actions = [{
++      itemId: item.id,
++      itemName: item.name,
++      action: 'reduce',
++      amountDeltaXof: release,
++      consequence: item.deferralImpact || 'Réduire le montant prévu.',
++      itemVersion: Number(item.version),
++      priority: Number(item.priority),
++      dueOn: item.dueOn,
++    }];
++    if (item.dueOn || item.cadence === 'once') {
++      actions.push({
++        itemId: item.id,
++        itemName: item.name,
++        action: 'defer',
++        amountDeltaXof: item.plannedAmountXof,
++        consequence: item.deferralImpact || 'Reporter la prochaine échéance.',
++        itemVersion: Number(item.version),
++        priority: Number(item.priority),
++        dueOn: item.dueOn,
++      });
++    }
++    actions.push({
++      itemId: item.id,
++      itemName: item.name,
++      action: 'pause',
++      amountDeltaXof: item.plannedAmountXof,
++      consequence: item.deferralImpact || 'Mettre temporairement en pause cet engagement.',
++      itemVersion: Number(item.version),
++      priority: Number(item.priority),
++      dueOn: item.dueOn,
++    });
++    return actions;
++  });
++
++  const baselineAfter = availableXof - Number(event.amountXof);
++  if (!Number.isSafeInteger(baselineAfter)) throw new RangeError('Le solde dépasse la précision prise en charge.');
++  const candidates = [{
++    id: 'use-available-balance',
++    actions: [{
++      itemId: null,
++      itemName: 'Solde disponible',
++      action: 'allocate',
++      amountDeltaXof: Number(event.amountXof),
++      consequence: 'Affecter le solde disponible à cet imprévu.',
++      itemVersion: 0,
++      priority: 5,
++      dueOn: event.dueOn ?? null,
++    }],
++    availableBeforeXof: availableXof,
++    eventAmountXof: Number(event.amountXof),
++    availableAfterXof: baselineAfter,
++    explanation: 'Financer l’imprévu avec le solde disponible, sans modifier les engagements.',
++    priorityScore: 0,
++    admissible: baselineAfter >= 0,
++  }];
++  for (const action of candidateActions) {
++    candidates.push(makeCandidate([action], availableXof, Number(event.amountXof)));
++  }
++  const orderedActions = [...candidateActions].sort((a, b) =>
++    b.amountDeltaXof - a.amountDeltaXof || a.itemId.localeCompare(b.itemId) || a.action.localeCompare(b.action),
++  );
++  for (let first = 0; first < orderedActions.length && candidates.length < 48; first += 1) {
++    for (let second = first + 1; second < orderedActions.length && candidates.length < 48; second += 1) {
++      if (orderedActions[first].itemId === orderedActions[second].itemId) continue;
++      candidates.push(makeCandidate([orderedActions[first], orderedActions[second]], availableXof, Number(event.amountXof)));
++    }
++  }
++  const unique = [...new Map(candidates.map((candidate) => [candidate.id, candidate])).values()];
++  const ranked = unique.sort((a, b) =>
++    (b.availableAfterXof >= 0) - (a.availableAfterXof >= 0)
++    || b.priorityScore - a.priorityScore
++    || a.actions.length - b.actions.length
++    || a.id.localeCompare(b.id),
++  );
++  const selected = ranked.slice(0, 12);
++  if (!selected.some((candidate) => candidate.id === 'use-available-balance')) selected[selected.length - 1] = candidates[0];
++
++  const dataVersion = createHash('sha256').update(JSON.stringify({
++    event: { id: event.id, version: Number(event.version), amountXof: Number(event.amountXof) },
++    month,
++    summary: [summary.incomeXof, summary.expensesXof, summary.plannedXof],
++    items: activeItems.map(({ id, version, plannedAmountXof, status }) => [id, Number(version), plannedAmountXof, status]).sort(),
++  })).digest('hex');
++  return {
++    dataVersion,
++    availableBeforeXof: availableXof,
++    event: { id: event.id, title: event.title, amountXof: Number(event.amountXof), urgency: Number(event.urgency) },
++    candidates: selected,
++  };
++}
++
++function makeCandidate(actions, available, eventAmount) {
++  const freed = actions.reduce((sum, action) => sum + (action.action === 'allocate' ? 0 : action.amountDeltaXof), 0);
++  if (!safeInteger(freed) || !safeInteger(available + freed - eventAmount)) throw new RangeError('Le solde dépasse la précision prise en charge.');
++  const normalized = [...actions].sort((a, b) => a.itemId.localeCompare(b.itemId) || a.action.localeCompare(b.action));
++  const id = createHash('sha256').update(JSON.stringify(normalized.map(({ itemId, action, amountDeltaXof, itemVersion }) => [itemId, action, amountDeltaXof, itemVersion]))).digest('hex').slice(0, 24);
++  return {
++    id,
++    actions: normalized,
++    availableBeforeXof: available,
++    eventAmountXof: eventAmount,
++    availableAfterXof: available + freed - eventAmount,
++    explanation: normalized.map((action) => `${action.action}: ${action.consequence}`).join(' '),
++    priorityScore: normalized.reduce((score, action) => score + (6 - action.priority) * 1000, 0),
++    admissible: available + freed - eventAmount >= 0,
++  };
++}
+
+diff --git a/server/domain/scenarios.test.js b/server/domain/scenarios.test.js
+new file mode 100644
+--- /dev/null
++++ b/server/domain/scenarios.test.js
+@@ -0,0 +1,34 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { buildScenario } from './scenarios.js';
++
++const event = { id: 'event-1', title: 'Panne', amountXof: 50000, urgency: 5, version: 1 };
++const summary = { incomeXof: 250000, expensesXof: 50000, plannedXof: 120000 };
++const items = [
++  { id: 'item-1', name: 'Abonnement', status: 'active', plannedAmountXof: 30000, version: 2, priority: 1, dueOn: '2026-11-15', cadence: 'monthly', deferralImpact: 'Perte de service' },
++  { id: 'item-2', name: 'Dette', status: 'active', plannedAmountXof: 40000, version: 1, priority: 5, dueOn: '2026-11-20', cadence: 'once', deferralImpact: 'Frais de retard' },
++];
++
++test('simule plusieurs choix XOF sans muter les entrées', () => {
++  const original = structuredClone(items);
++  const result = buildScenario(event, summary, items, '2026-11');
++  assert.equal(result.availableBeforeXof, 80000);
++  assert.ok(result.candidates.length > 1);
++  const noAction = result.candidates.find((candidate) => candidate.id === 'use-available-balance');
++  assert.equal(noAction.eventAmountXof, 50000);
++  assert.equal(noAction.availableAfterXof, 30000);
++  assert.deepEqual(items, original);
++  assert.equal(result.candidates.some((candidate) => candidate.actions.some((action) => action.action === 'pause')), true);
++});
++
++test('signale les options qui ne couvrent pas le coût sans les rendre admissibles', () => {
++  const result = buildScenario(event, { incomeXof: 0, expensesXof: 0, plannedXof: 10000 }, [], '2026-11');
++  assert.equal(result.candidates[0].availableAfterXof, -60000);
++  assert.equal(result.candidates[0].admissible, false);
++});
++
++test('produit la même version pour un même instantané', () => {
++  const first = buildScenario(event, summary, items, '2026-11');
++  const second = buildScenario(event, summary, items, '2026-11');
++  assert.equal(first.dataVersion, second.dataVersion);
++});
+
+diff --git a/server/domain/recommendations.js b/server/domain/recommendations.js
+new file mode 100644
+--- /dev/null
++++ b/server/domain/recommendations.js
+@@ -0,0 +1,37 @@
++import { createHash } from 'node:crypto';
++
++export function deterministicRecommendations(candidates) {
++  if (!Array.isArray(candidates)) throw new TypeError('Les options de recommandation sont invalides.');
++  const ranked = [...candidates].sort((a, b) =>
++    (b.availableAfterXof >= 0) - (a.availableAfterXof >= 0)
++    || a.actions.length - b.actions.length
++    || b.availableAfterXof - a.availableAfterXof
++    || a.id.localeCompare(b.id),
++  );
++  return ranked.map((candidate, index) => ({
++    candidateId: candidate.id,
++    rank: index + 1,
++    explanation: candidate.explanation,
++    availableAfterXof: candidate.availableAfterXof,
++  }));
++}
++
++export function candidateHash(candidates) {
++  return createHash('sha256').update(JSON.stringify(candidates.map(({ id, actions, availableAfterXof }) => [id, actions, availableAfterXof]))).digest('hex');
++}
++
++export function validateGroqRanking(payload, candidateIds) {
++  if (!payload || Object.keys(payload).length !== 1 || !Array.isArray(payload.options) || payload.options.length !== candidateIds.length) return null;
++  const permitted = new Set(candidateIds);
++  const seen = new Set();
++  const result = [];
++  for (const option of payload.options) {
++    if (!option || Object.keys(option).some((key) => !['candidateId', 'explanation'].includes(key))
++        || Object.keys(option).length !== 2) return null;
++    if (!option || typeof option.candidateId !== 'string' || !permitted.has(option.candidateId) || seen.has(option.candidateId)) return null;
++    if (typeof option.explanation !== 'string' || option.explanation.trim().length < 1 || option.explanation.length > 240) return null;
++    seen.add(option.candidateId);
++    result.push({ candidateId: option.candidateId, explanation: option.explanation.trim() });
++  }
++  return seen.size === permitted.size ? result : null;
++}
+
+diff --git a/server/domain/recommendations.test.js b/server/domain/recommendations.test.js
+new file mode 100644
+--- /dev/null
++++ b/server/domain/recommendations.test.js
+@@ -0,0 +1,34 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { candidateHash, deterministicRecommendations, validateGroqRanking } from './recommendations.js';
++
++const candidates = [
++  { id: 'shortfall', actions: [], availableAfterXof: -100 },
++  { id: 'covered', actions: [{ action: 'reduce', amountDeltaXof: 100 }], availableAfterXof: 0 },
++];
++
++test('classe les options couvrables avant les déficits', () => {
++  const result = deterministicRecommendations(candidates);
++  assert.equal(result[0].candidateId, 'covered');
++  assert.equal(result[0].rank, 1);
++});
++
++test('refuse une réponse Groq incomplète, inconnue ou mal formée', () => {
++  assert.equal(validateGroqRanking({ options: [{ candidateId: 'made-up', explanation: 'Choix' }] }, ['covered']), null);
++  assert.equal(validateGroqRanking({ options: [{ candidateId: 'covered', explanation: 'Choix' }], metadata: 'extra' }, ['covered']), null);
++  assert.equal(validateGroqRanking({ options: [{ candidateId: 'covered', explanation: 'Choix' }] }, ['covered', 'shortfall']), null);
++  assert.equal(validateGroqRanking({ options: [{ candidateId: 'covered', explanation: 'Choix', amount: 10 }] }, ['covered']), null);
++  assert.equal(validateGroqRanking({ options: [{ candidateId: 'covered', explanation: 'x'.repeat(241) }] }, ['covered']), null);
++});
++
++test('accepte uniquement une permutation complète des candidats', () => {
++  const result = validateGroqRanking({ options: [
++    { candidateId: 'covered', explanation: 'Option couvrable.' },
++    { candidateId: 'shortfall', explanation: 'Reste à financer.' },
++  ] }, ['covered', 'shortfall']);
++  assert.deepEqual(result.map((option) => option.candidateId), ['covered', 'shortfall']);
++});
++
++test('calcule une empreinte stable des candidats', () => {
++  assert.equal(candidateHash(candidates), candidateHash(candidates));
++});
+
+diff --git a/server/services/scenario-service.js b/server/services/scenario-service.js
+new file mode 100644
+--- /dev/null
++++ b/server/services/scenario-service.js
+@@ -0,0 +1,77 @@
++import { getSql } from '../../api/_lib/db.js';
++import { buildScenario } from '../domain/scenarios.js';
++
++export async function loadScenarioContext(ownerId, eventId, month) {
++  const firstDay = `${month}-01`;
++  const nextMonth = nextMonthStart(month);
++  const sql = getSql();
++  const [[event], [totals], items] = await Promise.all([
++    sql`
++      SELECT id, title, amount_xof AS "amountXof", urgency, version, status
++      FROM unexpected_event
++      WHERE id = ${eventId} AND owner_id = ${ownerId}
++      LIMIT 1
++    `,
++    sql`
++      SELECT
++        COALESCE(SUM(amount_xof) FILTER (WHERE kind = 'income' AND status = 'paid'), 0)::bigint AS "incomeXof",
++        COALESCE(SUM(amount_xof) FILTER (WHERE kind = 'expense' AND status = 'paid'), 0)::bigint AS "expensesXof",
++        COALESCE(SUM(amount_xof) FILTER (WHERE kind = 'expense' AND status <> 'paid'), 0)::bigint
++        + COALESCE((
++          SELECT SUM(GREATEST(0, fi.planned_amount_xof - COALESCE(paid.amount_xof, 0)))
++          FROM financial_item fi
++          LEFT JOIN LATERAL (
++            SELECT SUM(t.amount_xof)::bigint AS amount_xof
++            FROM financial_transaction t
++            WHERE t.financial_item_id = fi.id AND t.owner_id = fi.owner_id
++              AND t.kind = 'expense' AND t.status = 'paid'
++              AND t.occurred_on >= ${firstDay}::date AND t.occurred_on < ${nextMonth}::date
++          ) paid ON true
++          WHERE fi.owner_id = ${ownerId} AND fi.status = 'active'
++            AND (fi.due_on IS NULL OR fi.due_on < ${nextMonth}::date)
++        ), 0)::bigint AS "plannedXof"
++      FROM financial_transaction
++      WHERE owner_id = ${ownerId}
++        AND (CASE WHEN status = 'paid' THEN occurred_on ELSE COALESCE(due_on, occurred_on) END) >= ${firstDay}::date
++        AND (CASE WHEN status = 'paid' THEN occurred_on ELSE COALESCE(due_on, occurred_on) END) < ${nextMonth}::date
++    `,
++    sql`
++      SELECT fi.id, fi.name,
++        GREATEST(0, fi.planned_amount_xof - COALESCE(paid.amount_xof, 0))::bigint AS "plannedAmountXof",
++        fi.due_on::text AS "dueOn", fi.cadence, fi.priority, fi.deferral_impact AS "deferralImpact",
++        fi.status, fi.version
++      FROM financial_item fi
++      LEFT JOIN LATERAL (
++        SELECT SUM(t.amount_xof)::bigint AS amount_xof
++        FROM financial_transaction t
++        WHERE t.financial_item_id = fi.id AND t.owner_id = fi.owner_id
++          AND t.kind = 'expense' AND t.status = 'paid'
++          AND t.occurred_on >= ${firstDay}::date AND t.occurred_on < ${nextMonth}::date
++      ) paid ON true
++      WHERE fi.owner_id = ${ownerId} AND fi.status = 'active'
++        AND (fi.due_on IS NULL OR fi.due_on < ${nextMonth}::date)
++      ORDER BY fi.priority DESC, fi.due_on NULLS LAST
++    `,
++  ]);
++  if (!event) return { error: 'EVENT_NOT_FOUND' };
++  if (!['open', 'planned'].includes(event.status)) return { error: 'EVENT_NOT_OPEN' };
++  const numeric = [event.amountXof, totals.incomeXof, totals.expensesXof, totals.plannedXof, ...items.map((item) => item.plannedAmountXof)];
++  if (numeric.some((value) => !Number.isSafeInteger(Number(value)))) return { error: 'AMOUNT_OUT_OF_RANGE' };
++  const summary = Object.fromEntries(['incomeXof', 'expensesXof', 'plannedXof'].map((key) => [key, Number(totals[key])]));
++  const result = buildScenario({ ...event, amountXof: Number(event.amountXof), version: Number(event.version) }, summary, items.map((item) => ({
++    ...item,
++    plannedAmountXof: Number(item.plannedAmountXof),
++    version: Number(item.version),
++    priority: Number(item.priority),
++  })), month);
++  return { event, summary, items, month, result };
++}
++
++export function nextMonthStart(month) {
++  const [year, value] = month.split('-').map(Number);
++  return value === 12 ? `${year + 1}-01-01` : `${year}-${String(value + 1).padStart(2, '0')}-01`;
++}
++
++export function isValidMonth(month) {
++  return typeof month === 'string' && /^\d{4}-(0[1-9]|1[0-2])$/.test(month) && Number(month.slice(0, 4)) >= 2000 && Number(month.slice(0, 4)) <= 2100;
++}
+
+diff --git a/server/providers/groq.js b/server/providers/groq.js
+new file mode 100644
+--- /dev/null
++++ b/server/providers/groq.js
+@@ -0,0 +1,45 @@
++const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
++const GROQ_MODEL = 'llama-3.3-70b-versatile';
++const TIMEOUT_MS = 5_000;
++
++export async function rankWithGroq(context, fetchImpl = fetch) {
++  const apiKey = process.env.GROQ_API_KEY;
++  if (!apiKey) return null;
++
++  const controller = new AbortController();
++  const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
++  try {
++    const response = await fetchImpl(GROQ_URL, {
++      method: 'POST',
++      signal: controller.signal,
++      headers: {
++        Authorization: `Bearer ${apiKey}`,
++        'Content-Type': 'application/json',
++      },
++      body: JSON.stringify({
++        model: GROQ_MODEL,
++        temperature: 0,
++        max_tokens: 1200,
++        response_format: { type: 'json_object' },
++        messages: [
++          {
++            role: 'system',
++            content: 'Classe les options de budget fournies. Ne crée ni ne modifie aucune option. Réponds uniquement en JSON: {"options":[{"candidateId":"identifiant fourni","explanation":"motif bref"}]}. Classe chaque candidateId exactement une fois. Les explications ne doivent ajouter aucun fait financier.',
++          },
++          { role: 'user', content: JSON.stringify(context) },
++        ],
++      }),
++    });
++    if (!response.ok) return null;
++    const payload = await response.json();
++    const content = payload?.choices?.[0]?.message?.content;
++    if (typeof content !== 'string' || content.length > 10_000) return null;
++    const parsed = JSON.parse(content);
++    if (!parsed || !Array.isArray(parsed.options)) return null;
++    return { options: parsed.options, model: GROQ_MODEL };
++  } catch {
++    return null;
++  } finally {
++    clearTimeout(timeout);
++  }
++}
+
+diff --git a/api/financial-items.js b/api/financial-items.js
+new file mode 100644
+--- /dev/null
++++ b/api/financial-items.js
+@@ -0,0 +1,152 @@
++import { requireOwner } from './_lib/auth.js';
++import { getSql } from './_lib/db.js';
++import { isSameOrigin, readJson, sendError, sendJson } from './_lib/http.js';
++import { validateFinancialItem } from '../server/domain/obligations.js';
++
++const columns = `id, kind, name, target_amount_xof AS "targetAmountXof",
++  remaining_amount_xof AS "remainingAmountXof", planned_amount_xof AS "plannedAmountXof",
++  due_on::text AS "dueOn", cadence, priority, deferral_impact AS "deferralImpact",
++  status, version, created_at AS "createdAt", updated_at AS "updatedAt"`;
++
++export default async function handler(req, res) {
++  const ownerId = await requireOwner(req, res);
++  if (!ownerId) return;
++  if (req.method === 'GET') return listItems(res, ownerId);
++  if (!isSameOrigin(req)) return sendError(res, 403, 'ORIGIN_REJECTED', 'Origine de requête refusée.');
++  if (req.method === 'POST') return createItem(req, res, ownerId);
++  if (req.method === 'PATCH') return updateItem(req, res, ownerId);
++  if (req.method === 'DELETE') return deleteItem(req, res, ownerId);
++  res.setHeader('Allow', 'GET, POST, PATCH, DELETE');
++  return sendError(res, 405, 'METHOD_NOT_ALLOWED', 'Méthode non autorisée.');
++}
++
++async function listItems(res, ownerId) {
++  const sql = getSql();
++  const rows = await sql`
++    SELECT ${sql.unsafe(columns)}
++    FROM financial_item
++    WHERE owner_id = ${ownerId}
++    ORDER BY priority DESC, due_on NULLS LAST, created_at DESC
++  `;
++  if (rows.some((item) => [item.targetAmountXof, item.remainingAmountXof, item.plannedAmountXof]
++    .some((value) => value != null && !Number.isSafeInteger(Number(value))))) {
++    return sendError(res, 422, 'AMOUNT_OUT_OF_RANGE', 'Un montant d’engagement dépasse la précision prise en charge.');
++  }
++  return sendJson(res, 200, { data: rows.map(serializeItem) });
++}
++
++async function createItem(req, res, ownerId) {
++  const input = await readJson(req, res);
++  if (!input) return;
++  const validation = validateFinancialItem(input);
++  if (!validation.ok) return sendError(res, 400, 'INVALID_FINANCIAL_ITEM', validation.message);
++  const item = validation.value;
++  const sql = getSql();
++  const [created] = await sql`
++    INSERT INTO financial_item (
++      owner_id, kind, name, target_amount_xof, remaining_amount_xof,
++      planned_amount_xof, due_on, cadence, priority, deferral_impact, status
++    ) VALUES (
++      ${ownerId}, ${item.kind}, ${item.name}, ${item.targetAmountXof ?? null},
++      ${item.remainingAmountXof ?? null}, ${item.plannedAmountXof}, ${item.dueOn ?? null},
++      ${item.cadence ?? null}, ${item.priority}, ${item.deferralImpact ?? ''}, ${item.status ?? 'active'}
++    )
++    RETURNING ${sql.unsafe(columns)}
++  `;
++  return sendJson(res, 201, { data: serializeItem(created) });
++}
++
++async function updateItem(req, res, ownerId) {
++  const input = await readJson(req, res);
++  if (!input) return;
++  const { id, version, ...changes } = input;
++  if (!isUuid(id) || !Number.isSafeInteger(version) || version < 1) {
++    return sendError(res, 400, 'INVALID_VERSION', 'L’identifiant et la version actuelle sont requis.');
++  }
++  const validation = validateFinancialItem(changes, { partial: true });
++  if (!validation.ok || Object.keys(validation.value).length === 0) {
++    return sendError(res, 400, 'INVALID_FINANCIAL_ITEM', validation.message ?? 'Aucune modification valide.');
++  }
++  const item = validation.value;
++  const sql = getSql();
++  const [current] = await sql`
++    SELECT id, kind, name, target_amount_xof AS "targetAmountXof",
++      remaining_amount_xof AS "remainingAmountXof", planned_amount_xof AS "plannedAmountXof",
++      due_on::text AS "dueOn", cadence, priority, deferral_impact AS "deferralImpact",
++      status, version
++    FROM financial_item WHERE id = ${id} AND owner_id = ${ownerId} AND version = ${version}
++    LIMIT 1
++  `;
++  if (!current) {
++    const [existing] = await sql`SELECT id FROM financial_item WHERE id = ${id} AND owner_id = ${ownerId}`;
++    return sendError(res, existing ? 409 : 404, existing ? 'VERSION_CONFLICT' : 'NOT_FOUND', existing ? 'L’engagement a changé. Rechargez les données.' : 'Engagement introuvable.');
++  }
++  const mergedValidation = validateFinancialItem({
++    ...current,
++    targetAmountXof: current.targetAmountXof == null ? null : Number(current.targetAmountXof),
++    remainingAmountXof: current.remainingAmountXof == null ? null : Number(current.remainingAmountXof),
++    plannedAmountXof: Number(current.plannedAmountXof),
++    priority: Number(current.priority),
++    ...item,
++  });
++  if (!mergedValidation.ok) return sendError(res, 400, 'INVALID_FINANCIAL_ITEM', mergedValidation.message);
++  const has = (key) => Object.hasOwn(item, key);
++  const [updated] = await sql`
++    UPDATE financial_item SET
++      kind = CASE WHEN ${has('kind')} THEN ${item.kind ?? null}::text ELSE kind END,
++      name = CASE WHEN ${has('name')} THEN ${item.name ?? null}::text ELSE name END,
++      target_amount_xof = CASE WHEN ${has('targetAmountXof')} THEN ${item.targetAmountXof ?? null}::bigint ELSE target_amount_xof END,
++      remaining_amount_xof = CASE WHEN ${has('remainingAmountXof')} THEN ${item.remainingAmountXof ?? null}::bigint ELSE remaining_amount_xof END,
++      planned_amount_xof = CASE WHEN ${has('plannedAmountXof')} THEN ${item.plannedAmountXof ?? null}::bigint ELSE planned_amount_xof END,
++      due_on = CASE WHEN ${has('dueOn')} THEN ${item.dueOn ?? null}::date ELSE due_on END,
++      cadence = CASE WHEN ${has('cadence')} THEN ${item.cadence ?? null}::text ELSE cadence END,
++      priority = CASE WHEN ${has('priority')} THEN ${item.priority ?? null}::smallint ELSE priority END,
++      deferral_impact = CASE WHEN ${has('deferralImpact')} THEN ${item.deferralImpact ?? null}::text ELSE deferral_impact END,
++      status = CASE WHEN ${has('status')} THEN ${item.status ?? null}::text ELSE status END,
++      version = version + 1,
++      updated_at = now()
++    WHERE id = ${id} AND owner_id = ${ownerId} AND version = ${version}
++    RETURNING ${sql.unsafe(columns)}
++  `;
++  if (!updated) return sendError(res, 409, 'VERSION_CONFLICT', 'L’engagement a changé. Rechargez les données.');
++  return sendJson(res, 200, { data: serializeItem(updated) });
++}
++
++async function deleteItem(req, res, ownerId) {
++  const input = await readJson(req, res);
++  if (!input) return;
++  if (!isUuid(input.id) || !Number.isSafeInteger(input.version) || input.version < 1) {
++    return sendError(res, 400, 'INVALID_VERSION', 'L’identifiant et la version actuelle sont requis.');
++  }
++  const sql = getSql();
++  const [deleted] = await sql`
++    DELETE FROM financial_item fi
++    WHERE fi.id = ${input.id} AND fi.owner_id = ${ownerId} AND fi.version = ${input.version}
++      AND NOT EXISTS (
++        SELECT 1 FROM financial_transaction t
++        WHERE t.financial_item_id = fi.id AND t.owner_id = fi.owner_id
++      )
++      AND NOT EXISTS (
++        SELECT 1 FROM scenario_action a
++        WHERE a.financial_item_id = fi.id AND a.owner_id = fi.owner_id
++      )
++    RETURNING id
++  `;
++  if (!deleted) return sendError(res, 409, 'VERSION_CONFLICT', 'L’engagement est introuvable, a changé ou est lié à un mouvement.');
++  return sendJson(res, 200, { data: { id: deleted.id, deleted: true } });
++}
++
++function isUuid(value) {
++  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
++}
++
++function serializeItem(item) {
++  return {
++    ...item,
++    targetAmountXof: item.targetAmountXof == null ? null : Number(item.targetAmountXof),
++    remainingAmountXof: item.remainingAmountXof == null ? null : Number(item.remainingAmountXof),
++    plannedAmountXof: Number(item.plannedAmountXof),
++    priority: Number(item.priority),
++    version: Number(item.version),
++  };
++}
+
+diff --git a/api/financial-items.test.js b/api/financial-items.test.js
+new file mode 100644
+--- /dev/null
++++ b/api/financial-items.test.js
+@@ -0,0 +1,105 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import handler from './financial-items.js';
++import { setSqlForTests } from './_lib/db.js';
++
++const ownerId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
++const itemId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
++const token = 'a'.repeat(64);
++
++function installSqlMock({ updated = true } = {}) {
++  const calls = [];
++  const mock = async (parts, ...values) => {
++    const query = parts.join('?');
++    calls.push({ query, values });
++    if (query.includes('FROM auth_session')) return [{ owner_id: ownerId }];
++    if (query.includes('FROM financial_item') && query.includes('version = ?')) return [{
++      id: itemId, kind: 'debt', name: 'Moto', targetAmountXof: '90000',
++      remainingAmountXof: '60000', plannedAmountXof: '12000', dueOn: '2026-11-15',
++      cadence: 'monthly', priority: 4, deferralImpact: 'Frais de retard', status: 'active', version: 1,
++    }];
++    if (query.includes('INSERT INTO financial_item')) return [{
++      id: itemId, kind: 'debt', name: 'Moto', targetAmountXof: '90000',
++      remainingAmountXof: '60000', plannedAmountXof: '12000', dueOn: '2026-11-15',
++      cadence: 'monthly', priority: 4, deferralImpact: 'Frais de retard', status: 'active', version: 1,
++    }];
++    if (query.includes('UPDATE financial_item SET')) return updated ? [{
++      id: itemId, kind: 'debt', name: 'Moto', targetAmountXof: '90000',
++      remainingAmountXof: '60000', plannedAmountXof: '15000', dueOn: '2026-11-20',
++      cadence: 'monthly', priority: 5, deferralImpact: 'Frais', status: 'active', version: 2,
++    }] : [];
++    if (query.includes('SELECT id FROM financial_item')) return [{ id: itemId }];
++    if (query.includes('DELETE FROM financial_item')) return [{ id: itemId }];
++    throw new Error(`Requête non simulée: ${query}`);
++  };
++  mock.unsafe = (value) => value;
++  setSqlForTests(mock);
++  return calls;
++}
++
++function makeRequest({ method = 'POST', body = {}, cookie = `budget_session=${token}` } = {}) {
++  return {
++    method,
++    headers: { cookie, origin: 'http://localhost:3000', host: 'localhost:3000' },
++    async *[Symbol.asyncIterator]() {
++      if (method !== 'GET') yield Buffer.from(JSON.stringify(body));
++    },
++  };
++}
++
++function makeResponse() {
++  return {
++    statusCode: 0, headers: {}, body: '',
++    writeHead(status, headers) { this.statusCode = status; this.headers = headers; },
++    setHeader(name, value) { this.headers[name] = value; },
++    end(body = '') { this.body = body; },
++    json() { return JSON.parse(this.body); },
++  };
++}
++
++test('crée un engagement validé sous le propriétaire de la session', async () => {
++  const calls = installSqlMock();
++  const response = makeResponse();
++  await handler(makeRequest({ body: {
++    kind: 'debt', name: 'Moto', plannedAmountXof: 12000, targetAmountXof: 90000,
++    remainingAmountXof: 60000, dueOn: '2026-11-15', cadence: 'monthly',
++    priority: 4, deferralImpact: 'Frais de retard', ownerId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
++  } }), response);
++  assert.equal(response.statusCode, 201);
++  assert.equal(response.json().data.plannedAmountXof, 12000);
++  const insert = calls.find(({ query }) => query.includes('INSERT INTO financial_item'));
++  assert.ok(insert.values.includes(ownerId));
++  assert.equal(insert.values.includes('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'), false);
++});
++
++test('rejette un montant ou une date invalide avant toute écriture', async () => {
++  const calls = installSqlMock();
++  const response = makeResponse();
++  await handler(makeRequest({ body: { kind: 'debt', name: 'Moto', plannedAmountXof: -2, priority: 2, dueOn: '2026-13-40' } }), response);
++  assert.equal(response.statusCode, 400);
++  assert.equal(calls.some(({ query }) => query.includes('INSERT INTO financial_item')), false);
++});
++
++test('met à jour une version attendue et refuse une version périmée', async () => {
++  const calls = installSqlMock();
++  const response = makeResponse();
++  await handler(makeRequest({ method: 'PATCH', body: { id: itemId, version: 1, priority: 5, plannedAmountXof: 15000, dueOn: '2026-11-20' } }), response);
++  assert.equal(response.statusCode, 200);
++  const update = calls.find(({ query }) => query.includes('UPDATE financial_item SET'));
++  assert.ok(update.values.includes(ownerId));
++  assert.ok(update.values.includes(1));
++
++  installSqlMock({ updated: false });
++  const stale = makeResponse();
++  await handler(makeRequest({ method: 'PATCH', body: { id: itemId, version: 1, priority: 5 } }), stale);
++  assert.equal(stale.statusCode, 409);
++  assert.equal(stale.json().error.code, 'VERSION_CONFLICT');
++});
++
++test('exige une session avant de lire les engagements', async () => {
++  const calls = installSqlMock();
++  const response = makeResponse();
++  await handler(makeRequest({ cookie: '' }), response);
++  assert.equal(response.statusCode, 401);
++  assert.equal(calls.length, 0);
++});
+
+diff --git a/api/unexpected-events.js b/api/unexpected-events.js
+new file mode 100644
+--- /dev/null
++++ b/api/unexpected-events.js
+@@ -0,0 +1,123 @@
++import { requireOwner } from './_lib/auth.js';
++import { getSql } from './_lib/db.js';
++import { isSameOrigin, readJson, sendError, sendJson } from './_lib/http.js';
++import { isValidDate } from '../server/domain/transactions.js';
++
++export default async function handler(req, res) {
++  const ownerId = await requireOwner(req, res);
++  if (!ownerId) return;
++  if (req.method === 'GET') return listEvents(res, ownerId);
++  if (!isSameOrigin(req)) return sendError(res, 403, 'ORIGIN_REJECTED', 'Origine de requête refusée.');
++  if (req.method === 'POST') return createEvent(req, res, ownerId);
++  if (req.method === 'PATCH') return updateEvent(req, res, ownerId);
++  if (req.method === 'DELETE') return deleteEvent(req, res, ownerId);
++  res.setHeader('Allow', 'GET, POST, PATCH, DELETE');
++  return sendError(res, 405, 'METHOD_NOT_ALLOWED', 'Méthode non autorisée.');
++}
++
++async function listEvents(res, ownerId) {
++  const sql = getSql();
++  const rows = await sql`
++    SELECT id, title, amount_xof AS "amountXof", occurred_on::text AS "occurredOn",
++      due_on::text AS "dueOn", urgency, note, status, version
++    FROM unexpected_event WHERE owner_id = ${ownerId}
++    ORDER BY CASE status WHEN 'open' THEN 0 WHEN 'planned' THEN 1 ELSE 2 END, due_on NULLS LAST, created_at DESC
++  `;
++  if (rows.some((event) => !Number.isSafeInteger(Number(event.amountXof)) || Number(event.amountXof) <= 0)) {
++    return sendError(res, 422, 'AMOUNT_OUT_OF_RANGE', 'Un montant d’imprévu dépasse la précision prise en charge.');
++  }
++  return sendJson(res, 200, { data: rows.map(serializeEvent) });
++}
++
++async function createEvent(req, res, ownerId) {
++  const input = await readJson(req, res);
++  if (!input) return;
++  const invalid = validateEvent(input);
++  if (invalid) return sendError(res, 400, 'INVALID_EVENT', invalid);
++  const sql = getSql();
++  const [created] = await sql`
++    INSERT INTO unexpected_event (owner_id, title, amount_xof, occurred_on, due_on, urgency, note)
++    VALUES (${ownerId}, ${input.title.trim()}, ${input.amountXof}, ${input.occurredOn}, ${input.dueOn || null}, ${input.urgency}, ${input.note?.trim() ?? ''})
++    RETURNING id, title, amount_xof AS "amountXof", occurred_on::text AS "occurredOn",
++      due_on::text AS "dueOn", urgency, note, status, version
++  `;
++  return sendJson(res, 201, { data: serializeEvent(created) });
++}
++
++async function updateEvent(req, res, ownerId) {
++  const input = await readJson(req, res);
++  if (!input) return;
++  const { id, version, ...changes } = input;
++  if (!isUuid(id) || !Number.isSafeInteger(version) || version < 1 || Object.keys(changes).length === 0) {
++    return sendError(res, 400, 'INVALID_EVENT', 'L’identifiant, la version et au moins un champ sont requis.');
++  }
++  const invalid = validateEventUpdate(changes);
++  if (invalid) return sendError(res, 400, 'INVALID_EVENT', invalid);
++  const has = (key) => Object.hasOwn(changes, key);
++  const sql = getSql();
++  const [updated] = await sql`
++    UPDATE unexpected_event SET
++      title = CASE WHEN ${has('title')} THEN ${changes.title?.trim() ?? null}::text ELSE title END,
++      amount_xof = CASE WHEN ${has('amountXof')} THEN ${changes.amountXof ?? null}::bigint ELSE amount_xof END,
++      occurred_on = CASE WHEN ${has('occurredOn')} THEN ${changes.occurredOn ?? null}::date ELSE occurred_on END,
++      due_on = CASE WHEN ${has('dueOn')} THEN ${changes.dueOn || null}::date ELSE due_on END,
++      urgency = CASE WHEN ${has('urgency')} THEN ${changes.urgency ?? null}::smallint ELSE urgency END,
++      note = CASE WHEN ${has('note')} THEN ${changes.note?.trim() ?? null}::text ELSE note END,
++      status = CASE WHEN ${has('status')} THEN ${changes.status ?? null}::text ELSE status END,
++      version = version + 1,
++      updated_at = now()
++    WHERE id = ${id} AND owner_id = ${ownerId} AND version = ${version}
++    RETURNING id, title, amount_xof AS "amountXof", occurred_on::text AS "occurredOn",
++      due_on::text AS "dueOn", urgency, note, status, version
++  `;
++  if (!updated) return sendError(res, 409, 'VERSION_CONFLICT', 'L’imprévu a changé ou n’existe plus.');
++  return sendJson(res, 200, { data: serializeEvent(updated) });
++}
++
++async function deleteEvent(req, res, ownerId) {
++  const input = await readJson(req, res);
++  if (!input) return;
++  if (!isUuid(input.id) || !Number.isSafeInteger(input.version) || input.version < 1) {
++    return sendError(res, 400, 'INVALID_EVENT', 'L’identifiant et la version actuelle sont requis.');
++  }
++  const sql = getSql();
++  const [deleted] = await sql`
++    DELETE FROM unexpected_event ev
++    WHERE ev.id = ${input.id} AND ev.owner_id = ${ownerId} AND ev.version = ${input.version}
++      AND NOT EXISTS (SELECT 1 FROM scenario s WHERE s.event_id = ev.id AND s.owner_id = ev.owner_id)
++    RETURNING id
++  `;
++  if (!deleted) return sendError(res, 409, 'VERSION_CONFLICT', 'L’imprévu a changé, n’existe plus ou est lié à un scénario.');
++  return sendJson(res, 200, { data: { id: deleted.id, deleted: true } });
++}
++
++function validateEvent(input) {
++  if (!input || typeof input !== 'object' || Array.isArray(input)) return 'Les données de l’imprévu sont invalides.';
++  if (typeof input.title !== 'string' || input.title.trim().length < 1 || input.title.trim().length > 120) return 'Le titre doit contenir de 1 à 120 caractères.';
++  if (!Number.isSafeInteger(input.amountXof) || input.amountXof <= 0) return 'Le montant doit être un nombre entier positif en XOF.';
++  if (!isValidDate(input.occurredOn)) return 'Saisissez une date valide.';
++  if (input.dueOn != null && input.dueOn !== '' && !isValidDate(input.dueOn)) return 'Saisissez une échéance valide.';
++  if (!Number.isInteger(input.urgency) || input.urgency < 1 || input.urgency > 5) return 'L’urgence doit être comprise entre 1 et 5.';
++  if (input.note != null && (typeof input.note !== 'string' || input.note.length > 500)) return 'La note ne peut pas dépasser 500 caractères.';
++  return null;
++}
++
++function validateEventUpdate(input) {
++  if (Object.hasOwn(input, 'title') && (typeof input.title !== 'string' || input.title.trim().length < 1 || input.title.trim().length > 120)) return 'Le titre doit contenir de 1 à 120 caractères.';
++  if (Object.hasOwn(input, 'amountXof') && (!Number.isSafeInteger(input.amountXof) || input.amountXof <= 0)) return 'Le montant doit être un nombre entier positif en XOF.';
++  if (Object.hasOwn(input, 'occurredOn') && !isValidDate(input.occurredOn)) return 'Saisissez une date valide.';
++  if (Object.hasOwn(input, 'dueOn') && input.dueOn != null && input.dueOn !== '' && !isValidDate(input.dueOn)) return 'Saisissez une échéance valide.';
++  if (Object.hasOwn(input, 'urgency') && (!Number.isInteger(input.urgency) || input.urgency < 1 || input.urgency > 5)) return 'L’urgence doit être comprise entre 1 et 5.';
++  if (Object.hasOwn(input, 'note') && (typeof input.note !== 'string' || input.note.length > 500)) return 'La note ne peut pas dépasser 500 caractères.';
++  if (Object.hasOwn(input, 'status') && !['open', 'planned', 'resolved'].includes(input.status)) return 'Choisissez un statut valide.';
++  if (Object.keys(input).some((key) => !['title', 'amountXof', 'occurredOn', 'dueOn', 'urgency', 'note', 'status'].includes(key))) return 'Un champ de l’imprévu est inconnu.';
++  return null;
++}
++
++function isUuid(value) {
++  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
++}
++
++function serializeEvent(event) {
++  return { ...event, amountXof: Number(event.amountXof), urgency: Number(event.urgency), version: Number(event.version) };
++}
+
+diff --git a/api/unexpected-events.test.js b/api/unexpected-events.test.js
+new file mode 100644
+--- /dev/null
++++ b/api/unexpected-events.test.js
+@@ -0,0 +1,96 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import handler from './unexpected-events.js';
++import { setSqlForTests } from './_lib/db.js';
++
++const ownerId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
++const token = 'a'.repeat(64);
++
++function installSqlMock() {
++  const calls = [];
++  setSqlForTests(async (parts, ...values) => {
++    const query = parts.join('?');
++    calls.push({ query, values });
++    if (query.includes('FROM auth_session')) return [{ owner_id: ownerId }];
++    if (query.includes('INSERT INTO unexpected_event')) return [{
++      id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', title: 'Panne', amountXof: '25000',
++      occurredOn: '2026-11-01', dueOn: '2026-11-03', urgency: 5, note: 'Privé',
++      status: 'open', version: 1,
++    }];
++    if (query.includes('UPDATE unexpected_event SET')) return [{
++      id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', title: 'Panne', amountXof: '25000',
++      occurredOn: '2026-11-01', dueOn: '2026-11-03', urgency: 5, note: 'Privé',
++      status: 'resolved', version: 2,
++    }];
++    if (query.includes('DELETE FROM unexpected_event')) return [{ id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc' }];
++    throw new Error(`Requête non simulée: ${query}`);
++  });
++  return calls;
++}
++
++function makeResponse() {
++  return {
++    statusCode: 0, headers: {}, body: '',
++    writeHead(status, headers) { this.statusCode = status; this.headers = headers; },
++    setHeader(name, value) { this.headers[name] = value; },
++    end(body = '') { this.body = body; },
++    json() { return JSON.parse(this.body); },
++  };
++}
++
++function request(body, origin = 'http://localhost:3000') {
++  return {
++    method: 'POST',
++    headers: { cookie: `budget_session=${token}`, origin, host: 'localhost:3000' },
++    async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify(body)); },
++  };
++}
++
++function patchRequest(method, body) {
++  return {
++    method,
++    headers: { cookie: `budget_session=${token}`, origin: 'http://localhost:3000', host: 'localhost:3000' },
++    async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify(body)); },
++  };
++}
++
++test('crée un imprévu avec montant XOF validé et session propriétaire', async () => {
++  const calls = installSqlMock();
++  const response = makeResponse();
++  await handler(request({ title: 'Panne', amountXof: 25000, occurredOn: '2026-11-01', dueOn: '2026-11-03', urgency: 5, note: 'Privé' }), response);
++  assert.equal(response.statusCode, 201);
++  assert.equal(response.json().data.amountXof, 25000);
++  const insert = calls.find(({ query }) => query.includes('INSERT INTO unexpected_event'));
++  assert.ok(insert.values.includes(ownerId));
++});
++
++test('rejette une date impossible, un montant non entier et une origine étrangère', async () => {
++  const calls = installSqlMock();
++  const invalid = makeResponse();
++  await handler(request({ title: 'Panne', amountXof: 2.5, occurredOn: '2026-02-30', urgency: 3 }), invalid);
++  assert.equal(invalid.statusCode, 400);
++  assert.equal(calls.some(({ query }) => query.includes('INSERT INTO unexpected_event')), false);
++  const crossOrigin = makeResponse();
++  await handler(request({ title: 'Panne', amountXof: 1, occurredOn: '2026-11-01', urgency: 2 }, 'https://other.invalid'), crossOrigin);
++  assert.equal(crossOrigin.statusCode, 403);
++});
++
++test('met à jour ou supprime un imprévu avec sa version et son propriétaire', async () => {
++  const calls = installSqlMock();
++  const updated = makeResponse();
++  await handler(patchRequest('PATCH', {
++    id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', version: 1, status: 'resolved',
++  }), updated);
++  assert.equal(updated.statusCode, 200);
++  assert.equal(updated.json().data.version, 2);
++  const updateQuery = calls.find(({ query }) => query.includes('UPDATE unexpected_event SET'));
++  assert.ok(updateQuery.values.includes(ownerId));
++  assert.ok(updateQuery.values.includes(1));
++
++  const deleted = makeResponse();
++  await handler(patchRequest('DELETE', {
++    id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', version: 1,
++  }), deleted);
++  assert.equal(deleted.statusCode, 200);
++  assert.ok(calls.some(({ query }) => query.includes('NOT EXISTS (SELECT 1 FROM scenario')));
++});
+
+diff --git a/api/scenarios.js b/api/scenarios.js
+new file mode 100644
+--- /dev/null
++++ b/api/scenarios.js
+@@ -0,0 +1,205 @@
++import { createHash } from 'node:crypto';
++import { requireOwner } from './_lib/auth.js';
++import { getSql } from './_lib/db.js';
++import { isSameOrigin, readJson, sendError, sendJson } from './_lib/http.js';
++import { isValidMonth, loadScenarioContext } from '../server/services/scenario-service.js';
++
++const OPERATION = 'scenario-apply-v1';
++
++export default async function handler(req, res) {
++  const ownerId = await requireOwner(req, res);
++  if (!ownerId) return;
++  if (req.method === 'GET') return listScenarios(res, ownerId);
++  if (req.method !== 'POST') {
++    res.setHeader('Allow', 'GET, POST');
++    return sendError(res, 405, 'METHOD_NOT_ALLOWED', 'Méthode non autorisée.');
++  }
++  if (!isSameOrigin(req)) return sendError(res, 403, 'ORIGIN_REJECTED', 'Origine de requête refusée.');
++  const input = await readJson(req, res);
++  if (!input) return;
++  if (input.action === 'simulate') return simulate(res, ownerId, input);
++  if (input.action === 'confirm') return confirmScenario(res, req, ownerId, input);
++  return sendError(res, 400, 'INVALID_ACTION', 'Choisissez une simulation ou une confirmation valide.');
++}
++
++async function simulate(res, ownerId, input) {
++  if (!isUuid(input.eventId) || !isValidMonth(input.month)) {
++    return sendError(res, 400, 'INVALID_SCENARIO', 'Un imprévu et un mois valides sont requis.');
++  }
++  const context = await loadScenarioContext(ownerId, input.eventId, input.month);
++  if (context.error === 'EVENT_NOT_FOUND') return sendError(res, 404, 'NOT_FOUND', 'Imprévu introuvable.');
++  if (context.error === 'EVENT_NOT_OPEN') return sendError(res, 409, 'EVENT_CLOSED', 'Cet imprévu n’est plus ouvert à la simulation.');
++  if (context.error === 'AMOUNT_OUT_OF_RANGE') return sendError(res, 422, 'AMOUNT_OUT_OF_RANGE', 'Un montant dépasse la précision prise en charge.');
++  return sendJson(res, 200, { data: context.result });
++}
++
++async function confirmScenario(res, req, ownerId, input) {
++  const key = req.headers['idempotency-key'] ?? input.idempotencyKey;
++  if (typeof key !== 'string' || key.length < 8 || key.length > 128 || !/^[A-Za-z0-9._:-]+$/.test(key)) {
++    return sendError(res, 400, 'INVALID_IDEMPOTENCY_KEY', 'Une clé idempotente valide est requise.');
++  }
++  if (!isUuid(input.eventId) || !isValidMonth(input.month) || typeof input.candidateId !== 'string' || typeof input.dataVersion !== 'string') {
++    return sendError(res, 400, 'INVALID_SCENARIO', 'Le scénario confirmé est incomplet.');
++  }
++  const request = { eventId: input.eventId, month: input.month, candidateId: input.candidateId, dataVersion: input.dataVersion };
++  const requestHash = createHash('sha256').update(JSON.stringify(request)).digest('hex');
++  const sql = getSql();
++  const [prior] = await sql`
++    SELECT request_hash AS "requestHash", response
++    FROM idempotency_record
++    WHERE owner_id = ${ownerId} AND operation = ${OPERATION} AND idempotency_key = ${key}
++    LIMIT 1
++  `;
++  if (prior) {
++    if (prior.requestHash !== requestHash) return sendError(res, 409, 'IDEMPOTENCY_KEY_REUSED', 'Cette clé a déjà servi pour un autre scénario.');
++    return sendJson(res, 200, { data: prior.response, replayed: true });
++  }
++
++  const context = await loadScenarioContext(ownerId, input.eventId, input.month);
++  if (context.error === 'EVENT_NOT_FOUND') return sendError(res, 404, 'NOT_FOUND', 'Imprévu introuvable.');
++  if (context.error === 'EVENT_NOT_OPEN') return sendError(res, 409, 'EVENT_CLOSED', 'Cet imprévu est déjà résolu.');
++  if (context.error === 'AMOUNT_OUT_OF_RANGE') return sendError(res, 422, 'AMOUNT_OUT_OF_RANGE', 'Un montant dépasse la précision prise en charge.');
++  if (context.result.dataVersion !== input.dataVersion) return sendError(res, 409, 'VERSION_CONFLICT', 'Le budget a changé depuis la simulation. Recommencez.');
++  const candidate = context.result.candidates.find((option) => option.id === input.candidateId);
++  if (!candidate) return sendError(res, 409, 'SCENARIO_NOT_ADMISSIBLE', 'Cette option ne fait plus partie des choix disponibles.');
++
++  const response = {
++    eventId: input.eventId,
++    month: input.month,
++    candidateId: candidate.id,
++    availableBeforeXof: candidate.availableBeforeXof,
++    eventAmountXof: candidate.eventAmountXof,
++    availableAfterXof: candidate.availableAfterXof,
++    actions: candidate.actions,
++    applied: true,
++  };
++  const actionRows = candidate.actions.map((action) => ({
++    item_id: action.itemId,
++    action: action.action,
++    amount_delta_xof: action.amountDeltaXof,
++    consequence: action.consequence,
++    item_version: action.itemVersion,
++  }));
++  const resultJson = JSON.stringify(response);
++  let saved;
++  try {
++    [saved] = await sql`
++      WITH action_input AS MATERIALIZED (
++        SELECT * FROM jsonb_to_recordset(${JSON.stringify(actionRows)}::jsonb)
++          AS a(item_id uuid, action text, amount_delta_xof bigint, consequence text, item_version integer)
++      ),
++      locked_event AS MATERIALIZED (
++        SELECT ev.id, ev.version, ev.status
++        FROM unexpected_event ev
++        WHERE ev.id = ${input.eventId} AND ev.owner_id = ${ownerId}
++        FOR UPDATE OF ev
++      ),
++      locked_items AS MATERIALIZED (
++        SELECT fi.id, fi.version, fi.status
++        FROM financial_item fi
++        JOIN action_input a ON a.item_id = fi.id
++        WHERE fi.owner_id = ${ownerId}
++        FOR UPDATE OF fi
++      ),
++      ready AS MATERIALIZED (
++        SELECT ev.id
++        FROM locked_event ev
++        WHERE ev.version = ${Number(context.event.version)}
++          AND ev.status IN ('open', 'planned')
++          AND NOT EXISTS (
++            SELECT 1 FROM action_input a
++            LEFT JOIN locked_items fi
++              ON fi.id = a.item_id AND fi.status = 'active' AND fi.version = a.item_version
++            WHERE a.item_id IS NOT NULL AND fi.id IS NULL
++          )
++      ),
++      updated_items AS (
++        UPDATE financial_item fi SET
++          planned_amount_xof = CASE
++            WHEN a.action = 'reduce' THEN GREATEST(0, fi.planned_amount_xof - a.amount_delta_xof)
++            ELSE fi.planned_amount_xof
++          END,
++          due_on = CASE
++            WHEN a.action = 'defer' THEN GREATEST(COALESCE(fi.due_on, ${`${input.month}-01`}::date), ${`${input.month}-01`}::date) + interval '1 month'
++            ELSE fi.due_on
++          END,
++          status = CASE WHEN a.action = 'pause' THEN 'paused' ELSE fi.status END,
++          version = fi.version + 1,
++          updated_at = now()
++        FROM action_input a
++        WHERE fi.id = a.item_id AND fi.owner_id = ${ownerId} AND fi.version = a.item_version
++          AND EXISTS (SELECT 1 FROM ready)
++        RETURNING fi.id
++      ),
++      updated_event AS (
++        UPDATE unexpected_event ev
++        SET status = 'resolved', version = ev.version + 1, updated_at = now()
++        WHERE ev.id = ${input.eventId} AND ev.owner_id = ${ownerId}
++          AND ev.version = ${Number(context.event.version)} AND EXISTS (SELECT 1 FROM ready)
++          AND (SELECT COUNT(*) FROM updated_items) =
++            (SELECT COUNT(*) FROM action_input WHERE item_id IS NOT NULL)
++        RETURNING ev.id
++      ),
++      saved_scenario AS (
++        INSERT INTO scenario (owner_id, name, budget_month, event_id, status, data_version, result, applied_at)
++        SELECT ${ownerId}, 'Simulation confirmée', ${`${input.month}-01`}::date, ${input.eventId},
++          'applied', ${input.dataVersion}, ${resultJson}::jsonb, now()
++        FROM ready
++        WHERE (SELECT COUNT(*) FROM updated_items) =
++          (SELECT COUNT(*) FROM action_input WHERE item_id IS NOT NULL)
++          AND EXISTS (SELECT 1 FROM updated_event)
++        RETURNING id
++      ),
++      saved_actions AS (
++        INSERT INTO scenario_action (owner_id, scenario_id, financial_item_id, action, amount_delta_xof, consequence)
++        SELECT ${ownerId}, s.id, a.item_id, a.action, a.amount_delta_xof, a.consequence
++        FROM saved_scenario s CROSS JOIN action_input a
++        RETURNING id
++      ),
++      saved_idempotency AS (
++        INSERT INTO idempotency_record (owner_id, operation, idempotency_key, request_hash, response)
++        SELECT ${ownerId}, ${OPERATION}, ${key}, ${requestHash},
++          jsonb_build_object('scenarioId', s.id, 'result', ${resultJson}::jsonb)
++        FROM saved_scenario s
++        ON CONFLICT (owner_id, operation, idempotency_key) DO NOTHING
++        RETURNING response
++      )
++      SELECT response FROM saved_idempotency
++    `;
++  } catch {
++    const [concurrent] = await sql`
++      SELECT request_hash AS "requestHash", response
++      FROM idempotency_record
++      WHERE owner_id = ${ownerId} AND operation = ${OPERATION} AND idempotency_key = ${key}
++      LIMIT 1
++    `;
++    if (concurrent?.requestHash === requestHash) return sendJson(res, 200, { data: concurrent.response, replayed: true });
++    throw new Error('Échec atomique de l’application du scénario.');
++  }
++  if (!saved) {
++    const [concurrent] = await sql`
++      SELECT request_hash AS "requestHash", response
++      FROM idempotency_record
++      WHERE owner_id = ${ownerId} AND operation = ${OPERATION} AND idempotency_key = ${key}
++      LIMIT 1
++    `;
++    if (concurrent?.requestHash === requestHash) return sendJson(res, 200, { data: concurrent.response, replayed: true });
++    return sendError(res, 409, 'VERSION_CONFLICT', 'Le budget a changé pendant la confirmation. Aucune modification n’a été appliquée.');
++  }
++  return sendJson(res, 200, { data: saved.response, replayed: false });
++}
++
++async function listScenarios(res, ownerId) {
++  const sql = getSql();
++  const rows = await sql`
++    SELECT id, name, budget_month::text AS month, event_id AS "eventId", status,
++      result, version, created_at AS "createdAt", applied_at AS "appliedAt"
++    FROM scenario WHERE owner_id = ${ownerId}
++    ORDER BY created_at DESC LIMIT 50
++  `;
++  return sendJson(res, 200, { data: rows });
++}
++
++function isUuid(value) {
++  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
++}
+
+diff --git a/api/scenarios.test.js b/api/scenarios.test.js
+new file mode 100644
+--- /dev/null
++++ b/api/scenarios.test.js
+@@ -0,0 +1,174 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { createHash } from 'node:crypto';
++import handler from './scenarios.js';
++import { setSqlForTests } from './_lib/db.js';
++
++const ownerId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
++const eventId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
++const itemId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
++const token = 'a'.repeat(64);
++const key = 'scenario-retry-key-2026';
++const responseData = { scenarioId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', result: { applied: true } };
++
++function installSqlMock({ prior = null, changeVersion = false } = {}) {
++  const calls = [];
++  let saved = prior;
++  setSqlForTests(async (parts, ...values) => {
++    const query = parts.join('?');
++    calls.push({ query, values });
++    if (query.includes('FROM auth_session')) return [{ owner_id: ownerId }];
++    if (query.includes('FROM idempotency_record')) return saved ? [saved] : [];
++    if (query.includes('WITH action_input AS MATERIALIZED')) {
++      saved = {
++        requestHash: values.find((value) => typeof value === 'string' && value === expectedRequestHash),
++        response: responseData,
++      };
++      return [{ response: responseData }];
++    }
++    if (query.includes('FROM unexpected_event')) return [{
++      id: eventId, title: 'Panne moto', amountXof: '30000', urgency: 5,
++      version: changeVersion ? 2 : 1, status: 'open',
++    }];
++    if (query.includes('SELECT fi.id')) return [{
++      id: itemId, name: 'Abonnement privé', plannedAmountXof: '50000', dueOn: '2026-11-18',
++      cadence: 'monthly', priority: 2, deferralImpact: 'Pénalité contractuelle',
++      status: 'active', version: 1,
++    }];
++    if (query.includes('AS "incomeXof"')) return [{
++      incomeXof: '200000', expensesXof: '0', plannedXof: '100000',
++    }];
++    if (query.includes('FROM financial_item')) return [];
++    throw new Error(`Requête non simulée: ${query}`);
++  });
++  return calls;
++}
++
++function makeRequest(body, extraHeaders = {}) {
++  return {
++    method: 'POST',
++    headers: {
++      cookie: `budget_session=${token}`,
++      origin: 'http://localhost:3000',
++      host: 'localhost:3000',
++      ...extraHeaders,
++    },
++    async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify(body)); },
++  };
++}
++
++function makeResponse() {
++  return {
++    statusCode: 0, headers: {}, body: '',
++    writeHead(status, headers) { this.statusCode = status; this.headers = headers; },
++    setHeader(name, value) { this.headers[name] = value; },
++    end(body = '') { this.body = body; },
++    json() { return JSON.parse(this.body); },
++  };
++}
++
++let expectedRequestHash = '';
++
++test('simule plusieurs impacts XOF sans muter de données financières', async () => {
++  const calls = installSqlMock();
++  const response = makeResponse();
++  await handler(makeRequest({ action: 'simulate', eventId, month: '2026-11' }), response);
++  assert.equal(response.statusCode, 200);
++  const result = response.json().data;
++  assert.ok(result.candidates.length > 1);
++  assert.equal(result.availableBeforeXof, 100000);
++  assert.equal(result.event.amountXof, 30000);
++  assert.ok(result.candidates.some((candidate) => candidate.availableAfterXof === 70000));
++  assert.ok(result.candidates.some((candidate) => candidate.actions.some((action) => action.consequence === 'Pénalité contractuelle')));
++  assert.equal(calls.some(({ query }) => /\b(INSERT|UPDATE|DELETE)\s/i.test(query)), false);
++});
++
++test('rejette une simulation lorsque le montant du contexte dépasse la précision sûre', async () => {
++  const calls = installSqlMock();
++  setSqlForTests(async (parts, ...values) => {
++    const query = parts.join('?');
++    calls.push({ query, values });
++    if (query.includes('FROM auth_session')) return [{ owner_id: ownerId }];
++    if (query.includes('FROM unexpected_event')) return [{ id: eventId, amountXof: String(Number.MAX_SAFE_INTEGER + 2), status: 'open', version: 1 }];
++    if (query.includes('AS "incomeXof"')) return [{ incomeXof: '0', expensesXof: '0', plannedXof: '0' }];
++    if (query.includes('SELECT fi.id')) return [];
++    return [];
++  });
++  const response = makeResponse();
++  await handler(makeRequest({ action: 'simulate', eventId, month: '2026-11' }), response);
++  assert.equal(response.statusCode, 422);
++  assert.equal(response.json().error.code, 'AMOUNT_OUT_OF_RANGE');
++});
++
++test('applique une option dans un unique statement atomique et retourne le même résultat au retry', async () => {
++  const calls = installSqlMock();
++  const simulated = makeResponse();
++  await handler(makeRequest({ action: 'simulate', eventId, month: '2026-11' }), simulated);
++  const proposal = simulated.json().data;
++  const chosen = proposal.candidates.find((candidate) => candidate.actions.some((action) => action.action !== 'allocate') && candidate.admissible);
++  assert.ok(chosen);
++  const input = {
++    eventId,
++    month: '2026-11',
++    candidateId: chosen.id,
++    dataVersion: proposal.dataVersion,
++  };
++  expectedRequestHash = createHash('sha256').update(JSON.stringify(input)).digest('hex');
++  const confirmation = { action: 'confirm', ...input, idempotencyKey: key };
++  const response = makeResponse();
++  await handler(makeRequest(confirmation, { 'idempotency-key': key }), response);
++  assert.equal(response.statusCode, 200);
++  assert.deepEqual(response.json().data, responseData);
++  const atomic = calls.find(({ query }) => query.includes('WITH action_input AS MATERIALIZED'));
++  assert.ok(atomic);
++  for (const statement of ['locked_event AS MATERIALIZED', 'locked_items AS MATERIALIZED', 'UPDATE financial_item', 'UPDATE unexpected_event', 'INSERT INTO scenario', 'INSERT INTO scenario_action', 'INSERT INTO idempotency_record']) {
++    assert.ok(atomic.query.includes(statement), statement);
++  }
++
++  const retry = makeResponse();
++  await handler(makeRequest(confirmation, { 'idempotency-key': key }), retry);
++  assert.equal(retry.statusCode, 200);
++  assert.equal(retry.json().replayed, true);
++  assert.deepEqual(retry.json().data, responseData);
++});
++
++test('rejette un scénario périmé sans exécuter le statement d’application', async () => {
++  const calls = installSqlMock({ changeVersion: true });
++  const response = makeResponse();
++  await handler(makeRequest({
++    action: 'confirm',
++    eventId,
++    month: '2026-11',
++    candidateId: 'use-available-balance',
++    dataVersion: 'b'.repeat(64),
++    idempotencyKey: key,
++  }), response);
++  assert.equal(response.statusCode, 409);
++  assert.equal(response.json().error.code, 'VERSION_CONFLICT');
++  assert.equal(calls.some(({ query }) => query.includes('WITH action_input AS MATERIALIZED')), false);
++});
++
++test('confirme atomiquement une affectation du solde sans modifier un engagement', async () => {
++  const calls = installSqlMock();
++  const input = {
++    eventId,
++    month: '2026-11',
++    candidateId: 'use-available-balance',
++  };
++  const simulated = makeResponse();
++  await handler(makeRequest({ action: 'simulate', eventId, month: input.month }), simulated);
++  const proposal = simulated.json().data;
++  assert.ok(proposal.candidates.some((candidate) => candidate.id === input.candidateId));
++  expectedRequestHash = createHash('sha256').update(JSON.stringify({ ...input, dataVersion: proposal.dataVersion })).digest('hex');
++  const response = makeResponse();
++  await handler(makeRequest({
++    action: 'confirm',
++    ...input,
++    dataVersion: proposal.dataVersion,
++    idempotencyKey: `${key}-allocate`,
++  }, { 'idempotency-key': `${key}-allocate` }), response);
++  assert.equal(response.statusCode, 200);
++  const atomic = calls.find(({ query }) => query.includes('WITH action_input AS MATERIALIZED'));
++  assert.ok(atomic);
++  assert.match(atomic.query, /COUNT\(\*\) FROM action_input WHERE item_id IS NOT NULL/);
++});
+
+diff --git a/api/recommendations.js b/api/recommendations.js
+new file mode 100644
+--- /dev/null
++++ b/api/recommendations.js
+@@ -0,0 +1,110 @@
++import { requireOwner } from './_lib/auth.js';
++import { getSql } from './_lib/db.js';
++import { isSameOrigin, readJson, sendError, sendJson } from './_lib/http.js';
++import { candidateHash, deterministicRecommendations, validateGroqRanking } from '../server/domain/recommendations.js';
++import { rankWithGroq } from '../server/providers/groq.js';
++import { isValidMonth, loadScenarioContext } from '../server/services/scenario-service.js';
++
++export default async function handler(req, res) {
++  const ownerId = await requireOwner(req, res);
++  if (!ownerId) return;
++  if (req.method !== 'POST') {
++    res.setHeader('Allow', 'POST');
++    return sendError(res, 405, 'METHOD_NOT_ALLOWED', 'Méthode non autorisée.');
++  }
++  if (!isSameOrigin(req)) return sendError(res, 403, 'ORIGIN_REJECTED', 'Origine de requête refusée.');
++  const input = await readJson(req, res);
++  if (!input) return;
++  if (typeof input.eventId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input.eventId)
++      || !isValidMonth(input.month)) {
++    return sendError(res, 400, 'INVALID_RECOMMENDATION', 'Un imprévu et un mois valides sont requis.');
++  }
++  const context = await loadScenarioContext(ownerId, input.eventId, input.month);
++  if (context.error === 'EVENT_NOT_FOUND') return sendError(res, 404, 'NOT_FOUND', 'Imprévu introuvable.');
++  if (context.error === 'EVENT_NOT_OPEN') return sendError(res, 409, 'EVENT_CLOSED', 'Cet imprévu n’est plus ouvert.');
++  if (context.error === 'AMOUNT_OUT_OF_RANGE') return sendError(res, 422, 'AMOUNT_OUT_OF_RANGE', 'Un montant dépasse la précision prise en charge.');
++
++  const candidates = context.result.candidates;
++  const fallback = deterministicRecommendations(candidates);
++  let recommendations = fallback;
++  let provider = 'rules';
++  let aiStatus = process.env.GROQ_API_KEY ? 'unavailable' : 'disabled';
++  let model = null;
++  if (process.env.GROQ_API_KEY) {
++    const sql = getSql();
++    const [throttle] = await sql`
++      INSERT INTO groq_request_throttle (owner_id, window_started_at, request_count)
++      VALUES (${ownerId}, now(), 1)
++      ON CONFLICT (owner_id) DO UPDATE SET
++        request_count = CASE
++          WHEN groq_request_throttle.window_started_at <= now() - interval '1 minute' THEN 1
++          ELSE groq_request_throttle.request_count + 1
++        END,
++        window_started_at = CASE
++          WHEN groq_request_throttle.window_started_at <= now() - interval '1 minute' THEN now()
++          ELSE groq_request_throttle.window_started_at
++        END
++      RETURNING request_count AS "requestCount"
++    `;
++    if (Number(throttle.requestCount) <= 10) {
++      const ai = await rankWithGroq({
++        version: 1,
++        month: input.month,
++        budget: {
++          availableBeforeXof: context.result.availableBeforeXof,
++          unexpectedAmountXof: context.result.event.amountXof,
++          urgency: context.result.event.urgency,
++        },
++        options: candidates.map((candidate) => ({
++          candidateId: candidate.id,
++          actions: candidate.actions.map(({ action, amountDeltaXof, priority, dueOn, consequence }) => ({
++            action, amountDeltaXof, priority, dueOn, consequence,
++          })),
++          availableAfterXof: candidate.availableAfterXof,
++        })),
++      });
++      const validated = ai && validateGroqRanking(ai, candidates.map((candidate) => candidate.id));
++      if (validated) {
++        const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
++        recommendations = validated.map((option, index) => ({
++          candidateId: option.candidateId,
++          rank: index + 1,
++          explanation: byId.get(option.candidateId).explanation,
++          availableAfterXof: byId.get(option.candidateId).availableAfterXof,
++        }));
++        provider = 'groq';
++        model = ai.model;
++        aiStatus = 'available';
++      }
++    } else {
++      aiStatus = 'rate_limited';
++    }
++  }
++
++  const minimalSnapshot = {
++    version: 1,
++    month: input.month,
++    budget: {
++      availableBeforeXof: context.result.availableBeforeXof,
++      unexpectedAmountXof: context.result.event.amountXof,
++      urgency: context.result.event.urgency,
++    },
++    candidates: candidates.map((candidate) => ({
++      id: candidate.id,
++      actions: candidate.actions.map(({ action, amountDeltaXof, priority, dueOn, consequence }) => ({
++        action, amountDeltaXof, priority, dueOn, consequence,
++      })),
++      availableAfterXof: candidate.availableAfterXof,
++    })),
++  };
++  const result = { recommendations, source: provider, aiStatus, dataVersion: context.result.dataVersion };
++  const sql = getSql();
++  await sql`
++    INSERT INTO recommendation (owner_id, input_snapshot, result, provider, model, candidate_hash)
++    VALUES (
++      ${ownerId}, ${JSON.stringify(minimalSnapshot)}::jsonb, ${JSON.stringify(result)}::jsonb,
++      ${provider}, ${model}, ${candidateHash(candidates)}
++    )
++  `;
++  return sendJson(res, 200, { data: result });
++}
+
+diff --git a/api/recommendations.test.js b/api/recommendations.test.js
+new file mode 100644
+--- /dev/null
++++ b/api/recommendations.test.js
+@@ -0,0 +1,95 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import handler from './recommendations.js';
++import { setSqlForTests } from './_lib/db.js';
++
++const ownerId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
++const eventId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
++const token = 'a'.repeat(64);
++
++function installSqlMock() {
++  const calls = [];
++  setSqlForTests(async (parts, ...values) => {
++    const query = parts.join('?');
++    calls.push({ query, values });
++    if (query.includes('FROM auth_session')) return [{ owner_id: ownerId }];
++    if (query.includes('FROM unexpected_event')) return [{
++      id: eventId, title: 'Panne secrète', amountXof: '25000', urgency: 4, version: 1, status: 'open',
++    }];
++    if (query.includes('SELECT fi.id')) return [{
++      id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', name: 'Nom privé',
++      plannedAmountXof: '20000', dueOn: '2026-11-15', cadence: 'monthly', priority: 2,
++      deferralImpact: 'Frais de retard', status: 'active', version: 1,
++    }];
++    if (query.includes('AS "incomeXof"')) return [{ incomeXof: '100000', expensesXof: '0', plannedXof: '20000' }];
++    if (query.includes('INSERT INTO recommendation')) return [];
++    if (query.includes('INSERT INTO groq_request_throttle')) return [{ requestCount: 1 }];
++    throw new Error(`Requête non simulée: ${query}`);
++  });
++  return calls;
++}
++
++function makeRequest() {
++  return {
++    method: 'POST',
++    headers: { cookie: `budget_session=${token}`, origin: 'http://localhost:3000', host: 'localhost:3000' },
++    async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ eventId, month: '2026-11' })); },
++  };
++}
++
++function makeResponse() {
++  return {
++    statusCode: 0, headers: {}, body: '',
++    writeHead(status, headers) { this.statusCode = status; this.headers = headers; },
++    setHeader(name, value) { this.headers[name] = value; },
++    end(body = '') { this.body = body; },
++    json() { return JSON.parse(this.body); },
++  };
++}
++
++test('sans clé Groq, retourne le classement déterministe et stocke un contexte minimisé', async () => {
++  const oldKey = process.env.GROQ_API_KEY;
++  delete process.env.GROQ_API_KEY;
++  const calls = installSqlMock();
++  const response = makeResponse();
++  try {
++    await handler(makeRequest(), response);
++    assert.equal(response.statusCode, 200);
++    assert.equal(response.json().data.source, 'rules');
++    assert.equal(response.json().data.aiStatus, 'disabled');
++    const insert = calls.find(({ query }) => query.includes('INSERT INTO recommendation'));
++    assert.ok(insert.values.includes(ownerId));
++    const snapshot = insert.values.find((value) => typeof value === 'string' && value.includes('"budget"'));
++    assert.ok(snapshot);
++    assert.equal(snapshot.includes('Panne secrète'), false);
++    assert.equal(snapshot.includes('Nom privé'), false);
++    assert.equal(snapshot.includes('Note à exclure'), false);
++    assert.equal(snapshot.includes('cccccccc-cccc-4ccc-8ccc-cccccccccccc'), false);
++  } finally {
++    if (oldKey === undefined) delete process.env.GROQ_API_KEY;
++    else process.env.GROQ_API_KEY = oldKey;
++  }
++});
++
++test('Groq timeout ou réponse invalide garde le secours déterministe sans inventer de succès', async () => {
++  const oldKey = process.env.GROQ_API_KEY;
++  const oldFetch = globalThis.fetch;
++  process.env.GROQ_API_KEY = 'test-key-not-a-real-secret';
++  const calls = installSqlMock();
++  globalThis.fetch = async () => ({
++    ok: true,
++    async json() { return { choices: [{ message: { content: '{"options":[{"candidateId":"unknown","explanation":"inventé"}]}' } }] }; },
++  });
++  const response = makeResponse();
++  try {
++    await handler(makeRequest(), response);
++    assert.equal(response.statusCode, 200);
++    assert.equal(response.json().data.source, 'rules');
++    assert.equal(response.json().data.aiStatus, 'unavailable');
++    assert.equal(calls.some(({ query }) => query.includes('INSERT INTO recommendation')), true);
++  } finally {
++    globalThis.fetch = oldFetch;
++    if (oldKey === undefined) delete process.env.GROQ_API_KEY;
++    else process.env.GROQ_API_KEY = oldKey;
++  }
++});
+
+diff --git a/api/export.js b/api/export.js
+new file mode 100644
+--- /dev/null
++++ b/api/export.js
+@@ -0,0 +1,62 @@
++import { requireOwner } from './_lib/auth.js';
++import { getSql } from './_lib/db.js';
++import { isSameOrigin, readJson, sendError, sendJson } from './_lib/http.js';
++
++export default async function handler(req, res) {
++  const ownerId = await requireOwner(req, res);
++  if (!ownerId) return;
++  if (req.method !== 'POST') {
++    res.setHeader('Allow', 'POST');
++    return sendError(res, 405, 'METHOD_NOT_ALLOWED', 'Méthode non autorisée.');
++  }
++  if (!isSameOrigin(req)) return sendError(res, 403, 'ORIGIN_REJECTED', 'Origine de requête refusée.');
++  const input = await readJson(req, res);
++  if (!input) return;
++  if (input.confirm !== true) return sendError(res, 400, 'CONFIRMATION_REQUIRED', 'Confirmez explicitement la création de l’export.');
++
++  const sql = getSql();
++  let exportedRows;
++  try {
++    exportedRows = await Promise.all([
++      sql`SELECT id, name, kind, is_default AS "isDefault", created_at AS "createdAt" FROM category WHERE owner_id = ${ownerId} ORDER BY kind, name`,
++      sql`SELECT id, kind, category_id AS "categoryId", financial_item_id AS "financialItemId",
++        amount_xof AS "amountXof", currency_code AS "currencyCode", occurred_on::text AS "occurredOn",
++        due_on::text AS "dueOn", payee, note, status, version, created_at AS "createdAt", updated_at AS "updatedAt"
++        FROM financial_transaction WHERE owner_id = ${ownerId} ORDER BY occurred_on, created_at`,
++      sql`SELECT id, kind, name, target_amount_xof AS "targetAmountXof",
++        remaining_amount_xof AS "remainingAmountXof", planned_amount_xof AS "plannedAmountXof",
++        due_on::text AS "dueOn", cadence, priority, deferral_impact AS "deferralImpact", status, version,
++        created_at AS "createdAt", updated_at AS "updatedAt"
++        FROM financial_item WHERE owner_id = ${ownerId} ORDER BY created_at`,
++      sql`SELECT id, title, amount_xof AS "amountXof", occurred_on::text AS "occurredOn",
++        due_on::text AS "dueOn", urgency, note, status, version, created_at AS "createdAt"
++        FROM unexpected_event WHERE owner_id = ${ownerId} ORDER BY created_at`,
++      sql`SELECT s.id, s.name, s.budget_month::text AS month, s.event_id AS "eventId", s.status,
++        s.result, s.version, s.created_at AS "createdAt", s.applied_at AS "appliedAt",
++        COALESCE(jsonb_agg(jsonb_build_object(
++          'financialItemId', a.financial_item_id, 'action', a.action,
++          'amountDeltaXof', a.amount_delta_xof, 'consequence', a.consequence
++        )) FILTER (WHERE a.id IS NOT NULL), '[]'::jsonb) AS actions
++        FROM scenario s LEFT JOIN scenario_action a ON a.scenario_id = s.id AND a.owner_id = s.owner_id
++        WHERE s.owner_id = ${ownerId} GROUP BY s.id ORDER BY s.created_at`,
++      sql`SELECT id, scenario_id AS "scenarioId", input_snapshot AS "inputSnapshot", result, provider,
++        model, schema_version AS "schemaVersion", prompt_version AS "promptVersion",
++        candidate_hash AS "candidateHash", created_at AS "createdAt"
++        FROM recommendation WHERE owner_id = ${ownerId} ORDER BY created_at`,
++    ]);
++  } catch {
++    return sendError(res, 503, 'EXPORT_FAILED', 'L’export est indisponible pour le moment. Aucune copie n’a été créée.');
++  }
++  const [categories, transactions, financialItems, unexpectedEvents, scenarios, recommendations] = exportedRows;
++  return sendJson(res, 200, {
++    exportedAt: new Date().toISOString(),
++    currencyCode: 'XOF',
++    timezone: 'Africa/Abidjan',
++    categories,
++    transactions,
++    financialItems,
++    unexpectedEvents,
++    scenarios,
++    recommendations,
++  }, { 'Content-Disposition': 'attachment; filename="budget-export.json"' });
++}
+
+diff --git a/api/export.test.js b/api/export.test.js
+new file mode 100644
+--- /dev/null
++++ b/api/export.test.js
+@@ -0,0 +1,68 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import handler from './export.js';
++import { setSqlForTests } from './_lib/db.js';
++
++const ownerId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
++const token = 'a'.repeat(64);
++
++function installSqlMock({ fail = false } = {}) {
++  const calls = [];
++  setSqlForTests(async (parts, ...values) => {
++    const query = parts.join('?');
++    calls.push({ query, values });
++    if (query.includes('FROM auth_session')) return [{ owner_id: ownerId }];
++    if (fail && query.includes('FROM recommendation')) throw new Error('database unavailable');
++    return [];
++  });
++  return calls;
++}
++
++function request(body) {
++  return {
++    method: 'POST',
++    headers: { cookie: `budget_session=${token}`, origin: 'http://localhost:3000', host: 'localhost:3000' },
++    async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify(body)); },
++  };
++}
++
++function response() {
++  return {
++    statusCode: 0, headers: {}, body: '',
++    writeHead(status, headers) { this.statusCode = status; this.headers = headers; },
++    setHeader(name, value) { this.headers[name] = value; },
++    end(body = '') { this.body = body; },
++    json() { return JSON.parse(this.body); },
++  };
++}
++
++test('requiert une confirmation explicite avant un export', async () => {
++  const calls = installSqlMock();
++  const result = response();
++  await handler(request({ confirm: false }), result);
++  assert.equal(result.statusCode, 400);
++  assert.equal(calls.filter(({ query }) => query.includes('FROM auth_session')).length, 1);
++});
++
++test('exporte uniquement les lignes du propriétaire et ne met pas le contenu en cache', async () => {
++  const calls = installSqlMock();
++  const result = response();
++  await handler(request({ confirm: true }), result);
++  assert.equal(result.statusCode, 200);
++  assert.equal(result.headers['Content-Disposition'], 'attachment; filename="budget-export.json"');
++  assert.equal(result.headers['Cache-Control'], 'no-store');
++  assert.equal(calls.length, 7);
++  for (const call of calls.slice(1)) assert.ok(call.values.includes(ownerId));
++  assert.deepEqual(Object.keys(result.json()).sort(), [
++    'categories', 'currencyCode', 'exportedAt', 'financialItems', 'recommendations',
++    'scenarios', 'timezone', 'transactions', 'unexpectedEvents',
++  ].sort());
++});
++
++test('renvoie un refus explicite si une partie des données ne peut pas être exportée', async () => {
++  installSqlMock({ fail: true });
++  const result = response();
++  await handler(request({ confirm: true }), result);
++  assert.equal(result.statusCode, 503);
++  assert.equal(result.json().error.code, 'EXPORT_FAILED');
++});
+
+diff --git a/api/transactions.js b/api/transactions.js
+new file mode 100644
+--- /dev/null
++++ b/api/transactions.js
+@@ -0,0 +1,174 @@
++import { requireOwner } from './_lib/auth.js';
++import { getSql } from './_lib/db.js';
++import { isSameOrigin, readJson, sendError, sendJson } from './_lib/http.js';
++import { monthRange, validateTransaction } from '../server/domain/transactions.js';
++
++const PAGE_SIZE = 100;
++
++export default async function handler(req, res) {
++  const ownerId = await requireOwner(req, res);
++  if (!ownerId) return;
++
++  if (req.method === 'GET') return listTransactions(req, res, ownerId);
++  if (req.method === 'POST') {
++    if (!isSameOrigin(req)) return sendError(res, 403, 'ORIGIN_REJECTED', 'Origine de requête refusée.');
++    return createTransaction(req, res, ownerId);
++  }
++
++  res.setHeader('Allow', 'GET, POST');
++  return sendError(res, 405, 'METHOD_NOT_ALLOWED', 'Méthode non autorisée.');
++}
++
++async function listTransactions(req, res, ownerId) {
++  const currentMonth = new Intl.DateTimeFormat('fr-CA', {
++    timeZone: 'Africa/Abidjan',
++    year: 'numeric',
++    month: '2-digit',
++  }).format(new Date());
++  const month = req.query?.month ?? currentMonth;
++  const range = monthRange(month);
++  if (!range) return sendError(res, 400, 'INVALID_MONTH', 'Le mois demandé est invalide.');
++  const offset = Number(req.query?.offset ?? 0);
++  if (!Number.isSafeInteger(offset) || offset < 0 || offset > 1_000_000) {
++    return sendError(res, 400, 'INVALID_OFFSET', 'Le décalage demandé est invalide.');
++  }
++
++  const sql = getSql();
++  const [transactionRows, [totals]] = await Promise.all([sql`
++    SELECT
++      t.id,
++      t.kind,
++      t.category_id AS "categoryId",
++      c.name AS "categoryName",
++      t.financial_item_id AS "financialItemId",
++      t.amount_xof AS "amountXof",
++      t.occurred_on::text AS "occurredOn",
++      t.due_on::text AS "dueOn",
++      t.payee,
++      t.note,
++      t.status,
++      t.created_at AS "createdAt"
++    FROM financial_transaction t
++    JOIN category c ON c.id = t.category_id AND c.owner_id = t.owner_id
++    WHERE t.owner_id = ${ownerId}
++      AND (CASE WHEN t.status = 'paid' THEN t.occurred_on ELSE COALESCE(t.due_on, t.occurred_on) END) >= ${range.start}::date
++      AND (CASE WHEN t.status = 'paid' THEN t.occurred_on ELSE COALESCE(t.due_on, t.occurred_on) END) < ${range.end}::date
++    ORDER BY
++      CASE WHEN t.status = 'paid' THEN t.occurred_on ELSE COALESCE(t.due_on, t.occurred_on) END DESC,
++      t.created_at DESC
++    LIMIT ${PAGE_SIZE + 1} OFFSET ${offset}
++  `, sql`
++    SELECT
++      COALESCE(SUM(amount_xof) FILTER (WHERE kind = 'income' AND status = 'paid'), 0)::bigint AS "incomeXof",
++      COALESCE(SUM(amount_xof) FILTER (WHERE kind = 'income' AND status <> 'paid'), 0)::bigint AS "plannedIncomeXof",
++      COALESCE(SUM(amount_xof) FILTER (WHERE kind = 'expense' AND status = 'paid'), 0)::bigint AS "expensesXof",
++      (
++        COALESCE(SUM(amount_xof) FILTER (WHERE kind = 'expense' AND status <> 'paid'), 0)
++        + COALESCE((
++          SELECT SUM(GREATEST(0, fi.planned_amount_xof - COALESCE(paid.amount_xof, 0)))
++          FROM financial_item fi
++          LEFT JOIN LATERAL (
++            SELECT SUM(t.amount_xof)::bigint AS amount_xof
++            FROM financial_transaction t
++            WHERE t.financial_item_id = fi.id AND t.owner_id = fi.owner_id
++              AND t.kind = 'expense' AND t.status = 'paid'
++              AND t.occurred_on >= ${range.start}::date AND t.occurred_on < ${range.end}::date
++          ) paid ON true
++          WHERE fi.owner_id = ${ownerId} AND fi.status = 'active'
++            AND (fi.due_on IS NULL OR fi.due_on < ${range.end}::date)
++        ), 0)
++      )::bigint AS "plannedXof"
++    FROM financial_transaction
++    WHERE owner_id = ${ownerId}
++      AND (CASE WHEN status = 'paid' THEN occurred_on ELSE COALESCE(due_on, occurred_on) END) >= ${range.start}::date
++      AND (CASE WHEN status = 'paid' THEN occurred_on ELSE COALESCE(due_on, occurred_on) END) < ${range.end}::date
++  `]);
++
++  const transactions = transactionRows.slice(0, PAGE_SIZE);
++  if (transactions.some((transaction) => !Number.isSafeInteger(Number(transaction.amountXof)) || Number(transaction.amountXof) <= 0)) {
++    return sendError(res, 422, 'AMOUNT_OUT_OF_RANGE', 'Un montant de mouvement dépasse la précision prise en charge.');
++  }
++  const safeTotals = [
++    totals.incomeXof,
++    totals.plannedIncomeXof,
++    totals.expensesXof,
++    totals.plannedXof,
++  ].map(Number);
++  if (safeTotals.some((value) => !Number.isSafeInteger(value))) {
++    return sendError(res, 422, 'AMOUNT_OUT_OF_RANGE', 'Le total dépasse la précision prise en charge.');
++  }
++  const availableXof = safeTotals[0] - safeTotals[2] - safeTotals[3];
++  if (!Number.isSafeInteger(availableXof)) {
++    return sendError(res, 422, 'AMOUNT_OUT_OF_RANGE', 'Le solde calculé dépasse la précision prise en charge.');
++  }
++
++  return sendJson(res, 200, {
++    data: {
++      month,
++      summary: {
++        incomeXof: Number(totals.incomeXof),
++        plannedIncomeXof: Number(totals.plannedIncomeXof),
++        expensesXof: Number(totals.expensesXof),
++        plannedXof: Number(totals.plannedXof),
++        availableXof,
++      },
++      transactions: transactions.map((transaction) => ({ ...transaction, amountXof: Number(transaction.amountXof) })),
++      pagination: {
++        offset,
++        limit: PAGE_SIZE,
++        hasMore: transactionRows.length > PAGE_SIZE,
++        nextOffset: offset + transactions.length,
++      },
++    },
++  });
++}
++
++async function createTransaction(req, res, ownerId) {
++  const input = await readJson(req, res);
++  if (!input) return;
++
++  const validation = validateTransaction(input);
++  if (!validation.ok) return sendError(res, 400, 'INVALID_TRANSACTION', validation.message);
++
++  const sql = getSql();
++  if (input.financialItemId) {
++    const [item] = await sql`
++      SELECT id
++      FROM financial_item
++      WHERE id = ${input.financialItemId} AND owner_id = ${ownerId} AND status = 'active'
++      LIMIT 1
++    `;
++    if (!item) return sendError(res, 400, 'INVALID_FINANCIAL_ITEM', 'Cet engagement est inaccessible ou inactif.');
++  }
++  const [category] = await sql`
++    SELECT id
++    FROM category
++    WHERE id = ${input.categoryId} AND owner_id = ${ownerId} AND kind = ${input.kind}
++    LIMIT 1
++  `;
++  if (!category) return sendError(res, 400, 'INVALID_CATEGORY', 'Cette catégorie ne correspond pas au mouvement.');
++
++  const [transaction] = await sql`
++    INSERT INTO financial_transaction (
++      owner_id, category_id, kind, amount_xof, currency_code,
++      occurred_on, due_on, payee, note, status, financial_item_id
++    )
++    VALUES (
++      ${ownerId}, ${input.categoryId}, ${input.kind}, ${input.amountXof}, 'XOF',
++      ${input.occurredOn}, ${input.dueOn || null}, ${input.payee?.trim() || null},
++      ${input.note?.trim() || null}, ${input.status ?? 'paid'}, ${input.financialItemId || null}
++    )
++    RETURNING
++      id,
++      kind,
++      category_id AS "categoryId",
++      amount_xof AS "amountXof",
++      occurred_on::text AS "occurredOn",
++      due_on::text AS "dueOn",
++      payee,
++      note,
++      status
++  `;
++
++  return sendJson(res, 201, { data: transaction });
++}
+
+diff --git a/api/transactions.test.js b/api/transactions.test.js
+new file mode 100644
+--- /dev/null
++++ b/api/transactions.test.js
+@@ -0,0 +1,232 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import handler from './transactions.js';
++import { setSqlForTests } from './_lib/db.js';
++
++const ownerId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
++const otherOwnerId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
++const categoryId = '01234567-89ab-4def-8123-456789abcdef';
++const sessionToken = 'a'.repeat(64);
++
++function installSqlMock({
++  category = { id: categoryId },
++  financialItem = { id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' },
++  transactions = [],
++  totals = { incomeXof: '10000', plannedIncomeXof: '3000', expensesXof: '2500', plannedXof: '1000' },
++} = {}) {
++  const calls = [];
++  setSqlForTests(async (parts, ...values) => {
++    const query = parts.join('?');
++    calls.push({ query, values });
++    if (query.includes('FROM auth_session')) return [{ owner_id: ownerId }];
++    if (query.includes('SUM(amount_xof)')) return [totals];
++    if (query.includes('FROM financial_item')) return financialItem ? [financialItem] : [];
++    if (query.includes('FROM category')) return category ? [category] : [];
++    if (query.includes('INSERT INTO financial_transaction')) {
++      return [{
++        id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
++        kind: 'expense',
++        categoryId,
++        amountXof: 2500,
++        occurredOn: '2026-10-29',
++        dueOn: null,
++        payee: 'Marché',
++        note: null,
++        status: 'paid',
++      }];
++    }
++    if (query.includes('FROM financial_transaction t')) return transactions;
++    if (query.includes('FROM financial_transaction')) {
++      return [totals];
++    }
++    throw new Error(`Requête non simulée dans ce test: ${query}`);
++  });
++  return calls;
++}
++
++function makeRequest({ method = 'POST', body = {}, cookie = `budget_session=${sessionToken}`, query = {} } = {}) {
++  return {
++    method,
++    query,
++    headers: {
++      cookie,
++      origin: 'http://localhost:3000',
++      host: 'localhost:3000',
++    },
++    async *[Symbol.asyncIterator]() {
++      if (method === 'POST') yield Buffer.from(JSON.stringify(body));
++    },
++  };
++}
++
++function makeResponse() {
++  return {
++    statusCode: 0,
++    headers: {},
++    body: '',
++    writeHead(status, headers) {
++      this.statusCode = status;
++      this.headers = headers;
++    },
++    setHeader(name, value) {
++      this.headers[name] = value;
++    },
++    end(body = '') {
++      this.body = body;
++    },
++    json() {
++      return JSON.parse(this.body);
++    },
++  };
++}
++
++const validPayload = {
++  kind: 'expense',
++  categoryId,
++  amountXof: 2500,
++  occurredOn: '2026-10-29',
++  payee: 'Marché',
++  status: 'paid',
++};
++
++test('refuse une session absente sans consulter les données', async () => {
++  const calls = installSqlMock();
++  const response = makeResponse();
++
++  await handler(makeRequest({ cookie: '' }), response);
++
++  assert.equal(response.statusCode, 401);
++  assert.equal(response.json().error.code, 'UNAUTHENTICATED');
++  assert.equal(calls.length, 0);
++});
++
++test('rejette un montant invalide sans écrire en base', async () => {
++  const calls = installSqlMock();
++  const response = makeResponse();
++
++  await handler(makeRequest({ body: { ...validPayload, amountXof: 0 } }), response);
++
++  assert.equal(response.statusCode, 400);
++  assert.equal(response.json().error.code, 'INVALID_TRANSACTION');
++  assert.equal(calls.some(({ query }) => query.includes('INSERT INTO financial_transaction')), false);
++});
++
++test('crée une transaction et lie le propriétaire issu de la session', async () => {
++  const calls = installSqlMock();
++  const response = makeResponse();
++
++  await handler(makeRequest({ body: { ...validPayload, ownerId: otherOwnerId } }), response);
++
++  assert.equal(response.statusCode, 201);
++  assert.equal(response.json().data.amountXof, 2500);
++  const insert = calls.find(({ query }) => query.includes('INSERT INTO financial_transaction'));
++  assert.ok(insert);
++  assert.ok(insert.values.includes(ownerId));
++  assert.equal(insert.values.includes(otherOwnerId), false);
++});
++
++test('refuse la catégorie qui ne correspond pas au propriétaire authentifié', async () => {
++  const calls = installSqlMock({ category: null });
++  const response = makeResponse();
++
++  await handler(makeRequest({ body: validPayload }), response);
++
++  assert.equal(response.statusCode, 400);
++  assert.equal(response.json().error.code, 'INVALID_CATEGORY');
++  const categoryQuery = calls.find(({ query }) => query.includes('FROM category'));
++  assert.ok(categoryQuery.query.includes('owner_id = ? AND kind = ?'));
++  assert.ok(categoryQuery.values.includes(ownerId));
++  assert.ok(categoryQuery.values.includes(validPayload.kind));
++});
++
++test('lie uniquement une dépense à un engagement actif du même propriétaire', async () => {
++  const linkedId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
++  const calls = installSqlMock();
++  const response = makeResponse();
++  await handler(makeRequest({ body: { ...validPayload, financialItemId: linkedId } }), response);
++  assert.equal(response.statusCode, 201);
++  const insert = calls.find(({ query }) => query.includes('INSERT INTO financial_transaction'));
++  assert.ok(insert.values.includes(linkedId));
++
++  const unauthorizedCalls = installSqlMock({ financialItem: null });
++  const unauthorized = makeResponse();
++  await handler(makeRequest({ body: { ...validPayload, financialItemId: linkedId } }), unauthorized);
++  assert.equal(unauthorized.statusCode, 400);
++  assert.equal(unauthorized.json().error.code, 'INVALID_FINANCIAL_ITEM');
++  assert.equal(unauthorizedCalls.some(({ query }) => query.includes('INSERT INTO financial_transaction')), false);
++});
++
++test('renvoie le total mensuel complet calculé côté serveur', async () => {
++  const calls = installSqlMock();
++  const response = makeResponse();
++
++  await handler(makeRequest({ method: 'GET', query: { month: '2026-10' } }), response);
++
++  assert.equal(response.statusCode, 200);
++  assert.deepEqual(response.json().data.summary, {
++    incomeXof: 10000,
++    plannedIncomeXof: 3000,
++    expensesXof: 2500,
++    plannedXof: 1000,
++    availableXof: 6500,
++  });
++  const rangeQueries = calls.filter(({ query }) => query.includes('FROM financial_transaction'));
++  assert.equal(rangeQueries.length, 2);
++  for (const { values } of rangeQueries) {
++    assert.ok(values.includes('2026-10-01'));
++    assert.ok(values.includes('2026-11-01'));
++  }
++  const aggregateQuery = rangeQueries.find(({ query }) => query.includes('SUM(amount_xof)'));
++  assert.ok(aggregateQuery);
++  assert.match(aggregateQuery.query, /kind = 'income' AND status = 'paid'/);
++  assert.match(aggregateQuery.query, /kind = 'income' AND status <> 'paid'/);
++  assert.match(aggregateQuery.query, /kind = 'expense' AND status = 'paid'/);
++  assert.match(aggregateQuery.query, /kind = 'expense' AND status <> 'paid'/);
++  assert.match(aggregateQuery.query, /COALESCE\(due_on, occurred_on\)/);
++  assert.match(rangeQueries[0].query, /ORDER BY\s+CASE WHEN t\.status = 'paid'/);
++});
++
++test('refuse un solde agrégé hors de la plage entière sûre', async () => {
++  installSqlMock({
++    totals: {
++      incomeXof: '0',
++      plannedIncomeXof: '0',
++      expensesXof: String(Number.MAX_SAFE_INTEGER),
++      plannedXof: '1',
++    },
++  });
++  const response = makeResponse();
++
++  await handler(makeRequest({ method: 'GET', query: { month: '2026-10' } }), response);
++
++  assert.equal(response.statusCode, 422);
++  assert.equal(response.json().error.code, 'AMOUNT_OUT_OF_RANGE');
++});
++
++test('expose la pagination et limite chaque page à 100 mouvements', async () => {
++  const transactions = Array.from({ length: 101 }, (_, index) => ({ id: `row-${index}`, amountXof: '100' }));
++  installSqlMock({ transactions });
++  const response = makeResponse();
++
++  await handler(makeRequest({ method: 'GET', query: { month: '2026-10', offset: '0' } }), response);
++
++  assert.equal(response.statusCode, 200);
++  assert.equal(response.json().data.transactions.length, 100);
++  assert.deepEqual(response.json().data.pagination, {
++    offset: 0,
++    limit: 100,
++    hasMore: true,
++    nextOffset: 100,
++  });
++});
++
++test('rejette un décalage invalide avant toute requête de liste', async () => {
++  const calls = installSqlMock();
++  const response = makeResponse();
++
++  await handler(makeRequest({ method: 'GET', query: { month: '2026-10', offset: '-1' } }), response);
++
++  assert.equal(response.statusCode, 400);
++  assert.equal(response.json().error.code, 'INVALID_OFFSET');
++  assert.equal(calls.some(({ query }) => query.includes('FROM financial_transaction')), false);
++});
+
+diff --git a/server/dev.js b/server/dev.js
+new file mode 100644
+--- /dev/null
++++ b/server/dev.js
+@@ -0,0 +1,43 @@
++import { createServer } from 'node:http';
++import { sendError } from '../api/_lib/http.js';
++import login from '../api/auth/login.js';
++import logout from '../api/auth/logout.js';
++import me from '../api/auth/me.js';
++import categories from '../api/categories.js';
++import transactions from '../api/transactions.js';
++import financialItems from '../api/financial-items.js';
++import unexpectedEvents from '../api/unexpected-events.js';
++import scenarios from '../api/scenarios.js';
++import recommendations from '../api/recommendations.js';
++import exportData from '../api/export.js';
++
++const routes = new Map([
++  ['/api/auth/login', login],
++  ['/api/auth/logout', logout],
++  ['/api/auth/me', me],
++  ['/api/categories', categories],
++  ['/api/transactions', transactions],
++  ['/api/financial-items', financialItems],
++  ['/api/unexpected-events', unexpectedEvents],
++  ['/api/scenarios', scenarios],
++  ['/api/recommendations', recommendations],
++  ['/api/export', exportData],
++]);
++
++const server = createServer(async (req, res) => {
++  const parsed = new URL(req.url ?? '/', 'http://localhost');
++  const handler = routes.get(parsed.pathname);
++  if (!handler) return sendError(res, 404, 'NOT_FOUND', 'La route demandée est introuvable.');
++
++  req.query = Object.fromEntries(parsed.searchParams);
++  try {
++    await handler(req, res);
++  } catch (error) {
++    console.error('Erreur API locale:', error instanceof Error ? error.message : 'Erreur inconnue');
++    if (!res.headersSent) sendError(res, 500, 'INTERNAL_ERROR', 'Une erreur serveur est survenue.');
++  }
++});
++
++server.listen(3000, '127.0.0.1', () => {
++  console.log('API Budget disponible sur http://127.0.0.1:3000');
++});
+
+diff --git a/src/contracts/api.ts b/src/contracts/api.ts
+new file mode 100644
+--- /dev/null
++++ b/src/contracts/api.ts
+@@ -0,0 +1,102 @@
++export type TransactionKind = 'income' | 'expense';
++export type TransactionStatus = 'planned' | 'paid' | 'deferred';
++
++export interface Category {
++  id: string;
++  name: string;
++  kind: TransactionKind;
++}
++
++export interface Transaction {
++  id: string;
++  kind: TransactionKind;
++  categoryId: string;
++  categoryName?: string;
++  amountXof: number;
++  occurredOn: string;
++  financialItemId?: string | null;
++  dueOn: string | null;
++  payee: string | null;
++  note: string | null;
++  status: TransactionStatus;
++}
++
++export interface MonthlySummary {
++  incomeXof: number;
++  plannedIncomeXof: number;
++  expensesXof: number;
++  plannedXof: number;
++  availableXof: number;
++}
++
++export type FinancialItemKind = 'debt' | 'subscription' | 'project' | 'custom';
++export type FinancialItemStatus = 'active' | 'paused' | 'completed' | 'cancelled';
++
++export interface FinancialItem {
++  id: string;
++  kind: FinancialItemKind;
++  name: string;
++  targetAmountXof: number | null;
++  remainingAmountXof: number | null;
++  plannedAmountXof: number;
++  dueOn: string | null;
++  cadence: 'once' | 'weekly' | 'monthly' | 'yearly' | null;
++  priority: number;
++  deferralImpact: string;
++  status: FinancialItemStatus;
++  version: number;
++}
++
++export interface UnexpectedEvent {
++  id: string;
++  title: string;
++  amountXof: number;
++  occurredOn: string;
++  dueOn: string | null;
++  urgency: number;
++  note: string;
++  status: 'open' | 'planned' | 'resolved';
++  version: number;
++}
++
++export interface ScenarioAction {
++  itemId: string | null;
++  itemName: string;
++  action: 'reduce' | 'defer' | 'pause' | 'allocate';
++  amountDeltaXof: number;
++  consequence: string;
++  itemVersion: number;
++  priority: number;
++  dueOn: string | null;
++}
++
++export interface ScenarioCandidate {
++  id: string;
++  actions: ScenarioAction[];
++  availableBeforeXof: number;
++  eventAmountXof: number;
++  availableAfterXof: number;
++  explanation: string;
++  admissible: boolean;
++}
++
++export interface ScenarioSimulation {
++  dataVersion: string;
++  availableBeforeXof: number;
++  event: { id: string; title: string; amountXof: number; urgency: number };
++  candidates: ScenarioCandidate[];
++}
++
++export interface RecommendationResult {
++  candidateId: string;
++  rank: number;
++  explanation: string;
++  availableAfterXof: number;
++}
++
++export interface ApiError {
++  error: {
++    code: string;
++    message: string;
++  };
++}
+
+diff --git a/src/lib/api-client.ts b/src/lib/api-client.ts
+new file mode 100644
+--- /dev/null
++++ b/src/lib/api-client.ts
+@@ -0,0 +1,164 @@
++import type {
++  ApiError, Category, FinancialItem, FinancialItemKind,
++  MonthlySummary, RecommendationResult, ScenarioSimulation, Transaction,
++  TransactionKind, TransactionStatus, UnexpectedEvent,
++} from '../contracts/api';
++
++export class ApiRequestError extends Error {
++  constructor(message: string, readonly status: number, readonly code: string) {
++    super(message);
++    this.name = 'ApiRequestError';
++  }
++}
++
++async function request<T>(path: string, init?: RequestInit): Promise<T> {
++  const response = await fetch(path, {
++    credentials: 'same-origin',
++    headers: {
++      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
++      ...init?.headers,
++    },
++    ...init,
++  });
++  const responseBody = await response.text();
++  let payload: T | ApiError;
++  try {
++    if (!responseBody) throw new Error('Empty response');
++    payload = JSON.parse(responseBody) as T | ApiError;
++  } catch {
++    if (!response.ok) {
++      throw new ApiRequestError(`Le serveur a répondu sans message exploitable (HTTP ${response.status}).`, response.status, 'INVALID_RESPONSE');
++    }
++    throw new Error('La réponse du serveur est invalide.');
++  }
++  if (!response.ok) {
++    const error = payload as ApiError;
++    throw new ApiRequestError(
++      error.error?.message ?? 'Une erreur est survenue.',
++      response.status,
++      error.error?.code ?? 'REQUEST_FAILED',
++    );
++  }
++  return payload as T;
++}
++
++export const api = {
++  async login(email: string, password: string) {
++    return request('/api/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
++  },
++  async logout() {
++    return request('/api/auth/logout', { method: 'POST', body: '{}' });
++  },
++  async me() {
++    return request<{ data: { authenticated: boolean } }>('/api/auth/me');
++  },
++  async categories() {
++    const response = await request<{ data: Category[] }>('/api/categories');
++    return response.data;
++  },
++  async transactions(month: string, offset = 0) {
++    return request<{
++      data: {
++        month: string;
++        summary: MonthlySummary;
++        transactions: Transaction[];
++        pagination: { offset: number; limit: number; hasMore: boolean; nextOffset: number };
++      };
++    }>(`/api/transactions?month=${encodeURIComponent(month)}&offset=${offset}`);
++  },
++  async createTransaction(input: {
++    kind: TransactionKind;
++    categoryId: string;
++    amountXof: number;
++    occurredOn: string;
++    financialItemId?: string | null;
++    dueOn?: string;
++    payee?: string;
++    note?: string;
++    status: TransactionStatus;
++  }) {
++    return request<{ data: Transaction }>('/api/transactions', {
++      method: 'POST',
++      body: JSON.stringify(input),
++    });
++  },
++  async financialItems() {
++    const response = await request<{ data: FinancialItem[] }>('/api/financial-items');
++    return response.data;
++  },
++  async createFinancialItem(input: {
++    kind: FinancialItemKind;
++    name: string;
++    plannedAmountXof: number;
++    targetAmountXof?: number | null;
++    remainingAmountXof?: number | null;
++    dueOn?: string | null;
++    cadence?: FinancialItem['cadence'];
++    priority: number;
++    deferralImpact?: string;
++  }) {
++    const response = await request<{ data: FinancialItem }>('/api/financial-items', { method: 'POST', body: JSON.stringify(input) });
++    return response.data;
++  },
++  async updateFinancialItem(input: Partial<Omit<FinancialItem, 'id'>> & { id: string; version: number }) {
++    const response = await request<{ data: FinancialItem }>('/api/financial-items', { method: 'PATCH', body: JSON.stringify(input) });
++    return response.data;
++  },
++  async deleteFinancialItem(id: string, version: number) {
++    return request<{ data: { id: string; deleted: boolean } }>('/api/financial-items', {
++      method: 'DELETE', body: JSON.stringify({ id, version }),
++    });
++  },
++  async unexpectedEvents() {
++    const response = await request<{ data: UnexpectedEvent[] }>('/api/unexpected-events');
++    return response.data;
++  },
++  async createUnexpectedEvent(input: {
++    title: string;
++    amountXof: number;
++    occurredOn: string;
++    dueOn?: string;
++    urgency: number;
++    note?: string;
++  }) {
++    const response = await request<{ data: UnexpectedEvent }>('/api/unexpected-events', { method: 'POST', body: JSON.stringify(input) });
++    return response.data;
++  },
++  async updateUnexpectedEvent(input: Partial<Omit<UnexpectedEvent, 'id'>> & { id: string; version: number }) {
++    const response = await request<{ data: UnexpectedEvent }>('/api/unexpected-events', { method: 'PATCH', body: JSON.stringify(input) });
++    return response.data;
++  },
++  async simulateScenario(eventId: string, month: string) {
++    const response = await request<{ data: ScenarioSimulation }>('/api/scenarios', {
++      method: 'POST', body: JSON.stringify({ action: 'simulate', eventId, month }),
++    });
++    return response.data;
++  },
++  async confirmScenario(input: { eventId: string; month: string; candidateId: string; dataVersion: string; idempotencyKey: string }) {
++    const response = await request<{ data: { scenarioId: string; result: unknown }; replayed: boolean }>('/api/scenarios', {
++      method: 'POST',
++      headers: { 'Idempotency-Key': input.idempotencyKey },
++      body: JSON.stringify({ action: 'confirm', ...input }),
++    });
++    return response;
++  },
++  async recommendations(eventId: string, month: string) {
++    const response = await request<{
++      data: { recommendations: RecommendationResult[]; source: 'rules' | 'groq'; aiStatus: string; dataVersion: string };
++    }>('/api/recommendations', { method: 'POST', body: JSON.stringify({ eventId, month }) });
++    return response.data;
++  },
++  async exportData() {
++    const response = await fetch('/api/export', {
++      method: 'POST',
++      credentials: 'same-origin',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({ confirm: true }),
++    });
++    if (!response.ok) {
++      const body = await response.json().catch(() => null) as ApiError | null;
++      throw new ApiRequestError(body?.error?.message ?? 'L’export a échoué.', response.status, body?.error?.code ?? 'EXPORT_FAILED');
++    }
++    return response.blob();
++  },
++};
+
+diff --git a/src/ui/App.tsx b/src/ui/App.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/ui/App.tsx
+@@ -0,0 +1,627 @@
++import { useEffect, useMemo, useRef, useState } from 'react';
++import type { FormEvent } from 'react';
++import { api, ApiRequestError } from '../lib/api-client';
++import type {
++  Category, FinancialItem, MonthlySummary, RecommendationResult, ScenarioSimulation,
++  Transaction, TransactionKind, TransactionStatus, UnexpectedEvent,
++} from '../contracts/api';
++
++const today = new Intl.DateTimeFormat('en-CA', {
++  timeZone: 'Africa/Abidjan', year: 'numeric', month: '2-digit', day: '2-digit',
++}).format(new Date());
++const currentMonth = today.slice(0, 7);
++const currency = new Intl.NumberFormat('fr-FR', { maximumFractionDigits: 0 });
++type Page = 'overview' | 'movements' | 'priorities' | 'scenarios' | 'settings';
++
++function formatXof(amount: number) {
++  return `${currency.format(amount)} F CFA`;
++}
++
++function App() {
++  const [authenticated, setAuthenticated] = useState<boolean | null>(null);
++  const [categories, setCategories] = useState<Category[]>([]);
++  const [transactions, setTransactions] = useState<Transaction[]>([]);
++  const [items, setItems] = useState<FinancialItem[]>([]);
++  const [events, setEvents] = useState<UnexpectedEvent[]>([]);
++  const [summary, setSummary] = useState<MonthlySummary | null>(null);
++  const [month, setMonth] = useState(currentMonth);
++  const monthRef = useRef(month);
++  const listVersion = useRef(0);
++  monthRef.current = month;
++  const [refreshKey, setRefreshKey] = useState(0);
++  const [hasMore, setHasMore] = useState(false);
++  const [loadingMore, setLoadingMore] = useState(false);
++  const [loading, setLoading] = useState(true);
++  const [online, setOnline] = useState(navigator.onLine);
++  const [error, setError] = useState('');
++  const [notice, setNotice] = useState('');
++  const [page, setPage] = useState<Page>('overview');
++  const [selectedEventId, setSelectedEventId] = useState('');
++  const [simulation, setSimulation] = useState<ScenarioSimulation | null>(null);
++  const [recommendations, setRecommendations] = useState<RecommendationResult[]>([]);
++  const [recommendationSource, setRecommendationSource] = useState('');
++  const [recommendationEnabled, setRecommendationEnabled] = useState(false);
++
++  useEffect(() => {
++    const handleOnline = () => setOnline(true);
++    const handleOffline = () => setOnline(false);
++    window.addEventListener('online', handleOnline);
++    window.addEventListener('offline', handleOffline);
++    return () => {
++      window.removeEventListener('online', handleOnline);
++      window.removeEventListener('offline', handleOffline);
++    };
++  }, []);
++
++  useEffect(() => {
++    setSimulation(null);
++    setRecommendations([]);
++    setRecommendationSource('');
++  }, [month]);
++
++  useEffect(() => {
++    let active = true;
++    api.me()
++      .then(() => { if (active) setAuthenticated(true); })
++      .catch((sessionError: Error) => {
++        if (!active) return;
++        if (sessionError instanceof ApiRequestError && sessionError.status === 401) setAuthenticated(false);
++        else setError(sessionError.message);
++      })
++      .finally(() => { if (active) setLoading(false); });
++    return () => { active = false; };
++  }, []);
++
++  useEffect(() => {
++    if (authenticated !== true) return;
++    let active = true;
++    listVersion.current += 1;
++    setLoading(true);
++    setTransactions([]);
++    setSummary(null);
++    setHasMore(false);
++    Promise.all([api.categories(), api.transactions(month), api.financialItems(), api.unexpectedEvents()])
++      .then(([categoryList, result, financialItems, unexpectedEvents]) => {
++        if (!active) return;
++        setCategories(categoryList);
++        setTransactions(result.data.transactions);
++        setSummary(result.data.summary);
++        setHasMore(result.data.pagination.hasMore);
++        setItems(financialItems);
++        setEvents(unexpectedEvents);
++        setSelectedEventId((current) => current || unexpectedEvents.find((event) => event.status !== 'resolved')?.id || '');
++        setError('');
++      })
++      .catch((loadError: Error) => { if (active) setError(loadError.message); })
++      .finally(() => { if (active) setLoading(false); });
++    return () => { active = false; };
++  }, [month, authenticated, refreshKey]);
++
++  async function handleLoadMore() {
++    const requestedMonth = month;
++    const requestedVersion = listVersion.current;
++    setLoadingMore(true);
++    try {
++      const result = await api.transactions(requestedMonth, transactions.length);
++      if (monthRef.current !== requestedMonth || listVersion.current !== requestedVersion) return;
++      setTransactions((current) => [...current, ...result.data.transactions]);
++      setHasMore(result.data.pagination.hasMore);
++    } catch (loadError) {
++      setError((loadError as Error).message);
++    } finally {
++      setLoadingMore(false);
++    }
++  }
++
++  async function handleSessionRetry() {
++    setLoading(true);
++    setError('');
++    try {
++      await api.me();
++      setAuthenticated(true);
++    } catch (sessionError) {
++      if (sessionError instanceof ApiRequestError && sessionError.status === 401) setAuthenticated(false);
++      else setError((sessionError as Error).message);
++    } finally {
++      setLoading(false);
++    }
++  }
++
++  async function handleLogin(event: FormEvent<HTMLFormElement>) {
++    event.preventDefault();
++    setError('');
++    const form = new FormData(event.currentTarget);
++    try {
++      await api.login(String(form.get('email')), String(form.get('password')));
++      setMonth(currentMonth);
++      setLoading(true);
++      setAuthenticated(true);
++    } catch (loginError) {
++      setError((loginError as Error).message);
++    }
++  }
++
++  async function handleLogout() {
++    try {
++      await api.logout();
++      setAuthenticated(false);
++      setCategories([]);
++      setTransactions([]);
++      setItems([]);
++      setEvents([]);
++      setSummary(null);
++      setSimulation(null);
++    } catch (logoutError) {
++      setError((logoutError as Error).message);
++    }
++  }
++
++  async function handleCreateTransaction(event: FormEvent<HTMLFormElement>) {
++    event.preventDefault();
++    if (!online) return;
++    setError('');
++    setNotice('');
++    const formElement = event.currentTarget;
++    const form = new FormData(formElement);
++    const payload = {
++      kind: String(form.get('kind')) as TransactionKind,
++      categoryId: String(form.get('categoryId')),
++      financialItemId: String(form.get('financialItemId') ?? '') || null,
++      amountXof: Number(form.get('amountXof')),
++      occurredOn: String(form.get('occurredOn')),
++      dueOn: String(form.get('dueOn') ?? ''),
++      payee: String(form.get('payee') ?? ''),
++      note: String(form.get('note') ?? ''),
++      status: String(form.get('status')) as TransactionStatus,
++    };
++    try {
++      await api.createTransaction(payload);
++      formElement.reset();
++      const dateInput = document.querySelector<HTMLInputElement>('#transaction-date');
++      if (dateInput) dateInput.value = today;
++      setRefreshKey((value) => value + 1);
++      setNotice('Mouvement enregistré. Votre solde a été recalculé.');
++    } catch (saveError) {
++      setError((saveError as Error).message);
++    }
++  }
++
++  async function handleCreateItem(event: FormEvent<HTMLFormElement>) {
++    event.preventDefault();
++    if (!online) return;
++    const formElement = event.currentTarget;
++    const form = new FormData(formElement);
++    try {
++      await api.createFinancialItem({
++        kind: String(form.get('kind')) as FinancialItem['kind'],
++        name: String(form.get('name')),
++        targetAmountXof: form.get('targetAmountXof') ? Number(form.get('targetAmountXof')) : null,
++        remainingAmountXof: form.get('remainingAmountXof') ? Number(form.get('remainingAmountXof')) : null,
++        plannedAmountXof: Number(form.get('plannedAmountXof')),
++        dueOn: String(form.get('dueOn') ?? '') || null,
++        cadence: (String(form.get('cadence') ?? '') || null) as FinancialItem['cadence'],
++        priority: Number(form.get('priority')),
++        deferralImpact: String(form.get('deferralImpact') ?? ''),
++      });
++      formElement.reset();
++      setRefreshKey((value) => value + 1);
++      setNotice('Engagement ajouté à vos priorités.');
++    } catch (saveError) {
++      setError((saveError as Error).message);
++    }
++  }
++
++  async function handleUpdateItem(item: FinancialItem, form: FormEvent<HTMLFormElement>) {
++    form.preventDefault();
++    if (!online) return;
++    const values = new FormData(form.currentTarget);
++    try {
++      await api.updateFinancialItem({
++        id: item.id,
++        version: item.version,
++        priority: Number(values.get('priority')),
++        plannedAmountXof: Number(values.get('plannedAmountXof')),
++        dueOn: String(values.get('dueOn') ?? '') || null,
++        deferralImpact: String(values.get('deferralImpact') ?? ''),
++        status: String(values.get('status')) as FinancialItem['status'],
++      });
++      setRefreshKey((value) => value + 1);
++      setNotice('Engagement mis à jour.');
++    } catch (updateError) {
++      setError((updateError as Error).message);
++    }
++  }
++
++  async function handleDeleteItem(item: FinancialItem) {
++    if (!online || !window.confirm(`Supprimer « ${item.name} » ?`)) return;
++    try {
++      await api.deleteFinancialItem(item.id, item.version);
++      setRefreshKey((value) => value + 1);
++      setNotice('Engagement supprimé.');
++    } catch (deleteError) {
++      setError((deleteError as Error).message);
++    }
++  }
++
++  async function handleCreateEvent(event: FormEvent<HTMLFormElement>) {
++    event.preventDefault();
++    if (!online) return;
++    const formElement = event.currentTarget;
++    const form = new FormData(formElement);
++    try {
++      const created = await api.createUnexpectedEvent({
++        title: String(form.get('title')),
++        amountXof: Number(form.get('amountXof')),
++        occurredOn: String(form.get('occurredOn')),
++        dueOn: String(form.get('dueOn') ?? ''),
++        urgency: Number(form.get('urgency')),
++        note: String(form.get('note') ?? ''),
++      });
++      formElement.reset();
++      setSelectedEventId(created.id);
++      setSimulation(null);
++      setRecommendations([]);
++      setRefreshKey((value) => value + 1);
++      setNotice('Imprévu enregistré. Vous pouvez maintenant comparer des options.');
++    } catch (saveError) {
++      setError((saveError as Error).message);
++    }
++  }
++
++  async function handleSimulate() {
++    if (!online || !selectedEventId) return;
++    setError('');
++    setSimulation(null);
++    setRecommendations([]);
++    try {
++      setSimulation(await api.simulateScenario(selectedEventId, month));
++    } catch (simulationError) {
++      setError((simulationError as Error).message);
++    }
++  }
++
++  async function handleRecommendations() {
++    if (!online || !selectedEventId || !recommendationEnabled) return;
++    setError('');
++    try {
++      const result = await api.recommendations(selectedEventId, month);
++      setRecommendations(result.recommendations);
++      setRecommendationSource(result.source === 'groq'
++        ? 'Groq · options déterministes classées et validées'
++        : result.aiStatus === 'disabled'
++          ? 'Règles déterministes · aide IA désactivée'
++          : result.aiStatus === 'rate_limited'
++            ? 'Règles déterministes · limite d’appels IA atteinte'
++            : 'Règles déterministes · service IA indisponible, repli utilisé');
++    } catch (recommendationError) {
++      setError((recommendationError as Error).message);
++    }
++  }
++
++  async function handleConfirmScenario(candidateId: string) {
++    if (!online || !simulation || !selectedEventId) return;
++    const candidate = simulation.candidates.find((option) => option.id === candidateId);
++    if (!candidate?.admissible) return;
++    const actionSummary = candidate.actions.length
++      ? candidate.actions.map((action) => `${action.action} « ${action.itemName} »`).join(', ')
++      : 'aucune modification des engagements';
++    if (!window.confirm(`Confirmer ce scénario (${actionSummary}) ? Les modifications seront appliquées immédiatement.`)) return;
++    try {
++      await api.confirmScenario({
++        eventId: selectedEventId,
++        month,
++        candidateId,
++        dataVersion: simulation.dataVersion,
++        idempotencyKey: crypto.randomUUID(),
++      });
++      setSimulation(null);
++      setRecommendations([]);
++      setRefreshKey((value) => value + 1);
++      setNotice('Scénario confirmé une seule fois; l’imprévu est marqué comme résolu.');
++    } catch (confirmError) {
++      setError((confirmError as Error).message);
++    }
++  }
++
++  async function handleResolveEvent(event: UnexpectedEvent) {
++    if (!online || !window.confirm(`Marquer « ${event.title} » comme résolu ?`)) return;
++    try {
++      await api.updateUnexpectedEvent({ id: event.id, version: event.version, status: 'resolved' });
++      setRefreshKey((value) => value + 1);
++      setNotice('Imprévu marqué comme résolu.');
++    } catch (updateError) {
++      setError((updateError as Error).message);
++    }
++  }
++
++  async function handleExport() {
++    if (!online || !window.confirm('Télécharger une copie de toutes vos données budgétaires privées ?')) return;
++    try {
++      const blob = await api.exportData();
++      const url = URL.createObjectURL(blob);
++      const link = document.createElement('a');
++      link.href = url;
++      link.download = 'budget-export.json';
++      link.click();
++      URL.revokeObjectURL(url);
++      setNotice('Export téléchargé sur cet appareil.');
++    } catch (exportError) {
++      setError((exportError as Error).message);
++    }
++  }
++
++  const monthlyTitle = useMemo(() => new Intl.DateTimeFormat('fr-FR', {
++    month: 'long', year: 'numeric', timeZone: 'Africa/Abidjan',
++  }).format(new Date(`${month}-01T12:00:00Z`)), [month]);
++
++  if (loading) return <main className="loading-screen"><span className="brand-mark">B</span><p>Préparation de votre espace…</p></main>;
++  if (authenticated === null) {
++    return <main className="loading-screen"><p role="alert">{error || 'Impossible de vérifier votre session.'}</p><button className="primary-button retry-button" onClick={handleSessionRetry}>Réessayer</button></main>;
++  }
++  if (!authenticated) {
++    return (
++      <main className="login-layout">
++        <section className="login-story">
++          <span className="brand-mark">B</span><p className="eyebrow">VOTRE ARGENT, VOS CHOIX</p>
++          <h1>Un mois plus clair commence ici.</h1>
++          <p className="muted">Suivez vos revenus et vos dépenses en francs CFA. Vos données restent privées.</p>
++          <div className="login-note"><span>●</span> Accès personnel et sécurisé</div>
++        </section>
++        <section className="login-panel">
++          <div className="form-heading"><p className="eyebrow">BON RETOUR</p><h2>Se connecter</h2><p className="muted">Entrez les identifiants de votre compte Budget.</p></div>
++          <form onSubmit={handleLogin} className="stack-form">
++            <label>Adresse courriel<input name="email" type="email" autoComplete="username" required /></label>
++            <label>Mot de passe<input name="password" type="password" autoComplete="current-password" required /></label>
++            {error && <p className="form-error" role="alert">{error}</p>}
++            <button className="primary-button" type="submit">Ouvrir mon espace <span>→</span></button>
++          </form>
++          <p className="privacy-caption">Votre espace est privé. Aucun compte n’est créé depuis cette page.</p>
++        </section>
++      </main>
++    );
++  }
++
++  return (
++    <div className="app-shell">
++      <aside className="sidebar">
++        <a className="brand" href="#overview" onClick={() => setPage('overview')}><span className="brand-mark small">B</span><span>budget<span className="brand-dot">.</span></span></a>
++        <p className="nav-label">ESPACE PERSONNEL</p>
++        <nav className="main-nav" aria-label="Navigation principale">
++          <NavButton page="overview" current={page} onClick={setPage} icon="◫">Accueil</NavButton>
++          <NavButton page="movements" current={page} onClick={setPage} icon="↕">Mouvements</NavButton>
++          <NavButton page="priorities" current={page} onClick={setPage} icon="◎">Priorités</NavButton>
++          <NavButton page="scenarios" current={page} onClick={setPage} icon="↗">Imprévus</NavButton>
++          <NavButton page="settings" current={page} onClick={setPage} icon="⚙">Plus</NavButton>
++        </nav>
++        <div className="sidebar-bottom">
++          <div className="private-card"><span className="lock-icon">⌑</span><div><strong>Vos données restent privées</strong><small>Accès protégé · XOF</small></div></div>
++          <button className="logout-button" onClick={handleLogout}><span>↪</span> Se déconnecter</button>
++        </div>
++      </aside>
++      <main className="main-content">
++        <header className="topbar">
++          <div className="breadcrumb">Mon espace <span>/</span> <strong>{pageTitle(page)}</strong></div>
++          <div className="topbar-right"><span className={`connection-badge ${online ? 'online' : 'offline'}`}>{online ? 'En ligne' : 'Hors ligne'}</span><span className="timezone-badge">GMT+0 · Abidjan</span><span className="avatar">A</span><button className="mobile-logout" onClick={handleLogout}>Quitter</button></div>
++        </header>
++        <div className="page-content">
++          {!online && <div className="alert offline-alert" role="status">Hors connexion : les données affichées ne sont pas actualisées. Les saisies et mutations sont désactivées et ne seront pas enregistrées hors ligne.</div>}
++          {error && <div className="alert error-alert" role="alert">{error}</div>}
++          {notice && <div className="alert success-alert" role="status">{notice}</div>}
++          {page === 'overview' && (
++            <>
++              <section className="welcome-row">
++                <div><p className="eyebrow">SUIVI PERSONNEL</p><h1>Votre mois, en clair.</h1><p className="muted">Gardez le cap, une décision à la fois.</p></div>
++                <MonthPicker month={month} onChange={setMonth} />
++              </section>
++              <Summary summary={summary} monthTitle={monthlyTitle} />
++              <section className="workspace-grid">
++                <section className="panel transaction-panel">
++                  <PanelHeading eyebrow="SAISIE RAPIDE" title="Ajouter un mouvement" />
++                  <TransactionForm categories={categories} items={items} onSubmit={handleCreateTransaction} disabled={!online} />
++                </section>
++                <TransactionHistory transactions={transactions.slice(0, 8)} monthTitle={monthlyTitle} hasMore={hasMore} loadingMore={loadingMore} onLoadMore={handleLoadMore} />
++              </section>
++            </>
++          )}
++          {page === 'movements' && (
++            <>
++              <PageHeading eyebrow="HISTORIQUE" title="Vos mouvements" description="Revenus et dépenses du mois sélectionné." month={<MonthPicker month={month} onChange={setMonth} />} />
++              <Summary summary={summary} monthTitle={monthlyTitle} />
++              <section className="workspace-grid movements-grid">
++                <section className="panel transaction-panel"><PanelHeading eyebrow="SAISIE RAPIDE" title="Ajouter un mouvement" /><TransactionForm categories={categories} items={items} onSubmit={handleCreateTransaction} disabled={!online} /></section>
++                <TransactionHistory transactions={transactions} monthTitle={monthlyTitle} hasMore={hasMore} loadingMore={loadingMore} onLoadMore={handleLoadMore} />
++              </section>
++            </>
++          )}
++          {page === 'priorities' && (
++            <>
++              <PageHeading eyebrow="ENGAGEMENTS" title="Vos priorités" description="Montants planifiés, échéances et conséquences restent distincts des paiements." month={<MonthPicker month={month} onChange={setMonth} />} />
++              <section className="planning-grid">
++                <section className="panel">
++                  <PanelHeading eyebrow="NOUVEL ENGAGEMENT" title="Ajouter une priorité" />
++                  <FinancialItemForm onSubmit={handleCreateItem} disabled={!online} />
++                </section>
++                <section className="panel">
++                  <PanelHeading eyebrow="ENGAGEMENTS ENREGISTRÉS" title={`${items.length} priorité${items.length === 1 ? '' : 's'}`} />
++                  {items.length === 0 ? <EmptyMessage>Ajoutez un engagement pour préparer vos arbitrages.</EmptyMessage> : (
++                    <ul className="planning-list">{items.map((item) => (
++                      <li className="planning-card" key={item.id}>
++                        <div className="planning-card-heading"><div><span className="kind-label">{itemKind(item.kind)}</span><strong>{item.name}</strong></div><span className={`status-pill ${item.status}`}>{item.status}</span></div>
++                        <p className="planning-meta">{formatXof(item.plannedAmountXof)} prévus · priorité {item.priority}/5 · {item.dueOn ? `échéance ${item.dueOn}` : 'sans échéance'}</p>
++                        {item.remainingAmountXof != null && <p className="planning-meta">Reste dû : {formatXof(item.remainingAmountXof)}</p>}
++                        {item.deferralImpact && <p className="consequence-note">Report : {item.deferralImpact}</p>}
++                        <details className="edit-details"><summary>Modifier</summary>
++                          <form className="compact-form" onSubmit={(event) => handleUpdateItem(item, event)}>
++                            <label>Montant prévu<input name="plannedAmountXof" type="number" min="0" step="1" defaultValue={item.plannedAmountXof} required /></label>
++                            <label>Priorité<select name="priority" defaultValue={item.priority}>{[1, 2, 3, 4, 5].map((priority) => <option key={priority} value={priority}>{priority}/5</option>)}</select></label>
++                            <label>Échéance<input name="dueOn" type="date" defaultValue={item.dueOn ?? ''} /></label>
++                            <label>Statut<select name="status" defaultValue={item.status}><option value="active">Actif</option><option value="paused">En pause</option><option value="completed">Terminé</option><option value="cancelled">Annulé</option></select></label>
++                            <label className="wide-field">Conséquence d’un report<input name="deferralImpact" maxLength={500} defaultValue={item.deferralImpact} /></label>
++                            <button className="secondary-button" disabled={!online}>Enregistrer les changements</button>
++                            <button className="text-button delete-button" type="button" disabled={!online} onClick={() => void handleDeleteItem(item)}>Supprimer</button>
++                          </form>
++                        </details>
++                      </li>
++                    ))}</ul>
++                  )}
++                </section>
++              </section>
++            </>
++          )}
++          {page === 'scenarios' && (
++            <>
++              <PageHeading eyebrow="ARBITRAGES" title="Préparer un imprévu" description="Comparez des options explicables. Rien n’est appliqué avant votre confirmation." month={<MonthPicker month={month} onChange={setMonth} />} />
++              <section className="planning-grid scenario-grid">
++                <section className="panel">
++                  <PanelHeading eyebrow="NOUVEL ÉVÉNEMENT" title="Enregistrer un imprévu" />
++                  <UnexpectedEventForm onSubmit={handleCreateEvent} disabled={!online} />
++                </section>
++                <section className="panel">
++                  <PanelHeading eyebrow="SIMULATION" title="Comparer les options" />
++                  <div className="form-content">
++                    <label className="field-label">Imprévu ouvert<select value={selectedEventId} onChange={(event) => { setSelectedEventId(event.target.value); setSimulation(null); setRecommendations([]); }}><option value="">Choisir un imprévu…</option>{events.filter((item) => item.status !== 'resolved').map((item) => <option key={item.id} value={item.id}>{item.title} · {formatXof(item.amountXof)}</option>)}</select></label>
++                    <div className="event-list">{events.filter((item) => item.status !== 'resolved').map((event) => <div className="event-summary" key={event.id}><div><strong>{event.title}</strong><span>{formatXof(event.amountXof)} · urgence {event.urgency}/5{event.dueOn ? ` · échéance ${event.dueOn}` : ''}</span></div><button className="text-button" disabled={!online} onClick={() => void handleResolveEvent(event)}>Résolu</button></div>)}</div>
++                    <button className="secondary-button" disabled={!online || !selectedEventId} onClick={() => void handleSimulate()}>Simuler sans enregistrer</button>
++                    {simulation && <SimulationResults simulation={simulation} onConfirm={handleConfirmScenario} disabled={!online} />}
++                    {selectedEventId && <div className="recommendation-control">
++                      <label className="toggle-row"><input type="checkbox" checked={recommendationEnabled} onChange={(event) => { setRecommendationEnabled(event.target.checked); setRecommendations([]); }} />Autoriser l’aide facultative de Groq</label>
++                      <p className="form-hint left-hint">En cliquant, seuls les totaux, échéances, priorités et options admissibles sont envoyés. Notes et bénéficiaires sont exclus.</p>
++                      <button className="secondary-button" disabled={!online || !recommendationEnabled} onClick={() => void handleRecommendations()}>Classer ces options</button>
++                      {recommendationSource && <p className="source-label" role="status">{recommendationSource}</p>}
++                      {recommendations.length > 0 && <ol className="recommendation-list">{recommendations.map((item) => <li key={item.candidateId}><strong>Option {item.rank}</strong><span>{item.explanation}</span><small>Solde après imprévu : {formatXof(item.availableAfterXof)}</small></li>)}</ol>}
++                    </div>}
++                  </div>
++                </section>
++              </section>
++            </>
++          )}
++          {page === 'settings' && (
++            <>
++              <PageHeading eyebrow="PLUS" title="Réglages et vie privée" description="Contrôlez l’accès, l’aide externe et la portabilité de vos données." />
++              <div className="settings-grid">
++                <section className="panel settings-card"><PanelHeading eyebrow="CONFIGURATION" title="Votre espace" /><div className="settings-body"><p>Devise : <strong>XOF — franc CFA BCEAO</strong></p><p>Fuseau : <strong>Africa/Abidjan (GMT+0)</strong></p><p>Synchronisation : PostgreSQL via le serveur, lorsque le réseau est disponible.</p><div className="pwa-note">Installation PWA disponible depuis le menu de partage ou le menu du navigateur. Hors ligne, seul le shell statique reste accessible.</div></div></section>
++                <section className="panel settings-card"><PanelHeading eyebrow="VOS DONNÉES" title="Exporter votre budget" /><div className="settings-body"><p>L’export contient les données financières de ce compte uniquement. Il est généré côté serveur et n’est jamais mis en cache.</p><button className="secondary-button" disabled={!online} onClick={() => void handleExport()}>Télécharger l’export JSON</button></div></section>
++                <section className="panel settings-card privacy-policy"><PanelHeading eyebrow="AIDE IA" title="Groq reste facultatif" /><div className="settings-body"><p>Vous choisissez d’activer l’envoi à chaque demande. Les montants agrégés, échéances, priorités et actions proposées peuvent être transmis; les notes, bénéficiaires et historiques bruts ne le sont pas.</p><p>Une panne, une réponse invalide ou une limite d’usage laisse les options déterministes disponibles.</p></div></section>
++                <section className="panel settings-card privacy-policy"><PanelHeading eyebrow="SUPPRESSION" title="Demande de suppression" /><div className="settings-body"><p>La suppression automatique du compte n’est pas proposée. Avant la mise en production, une demande de suppression est traitée manuellement après vérification.</p></div></section>
++              </div>
++            </>
++          )}
++          <footer className="page-footer"><span>Budget personnel <b>·</b> Vos décisions restent les vôtres.</span><span>Franc CFA BCEAO <b>·</b> GMT+0</span></footer>
++        </div>
++      </main>
++    </div>
++  );
++}
++
++function NavButton({ page, current, onClick, icon, children }: { page: Page; current: Page; onClick: (page: Page) => void; icon: string; children: string }) {
++  return <button type="button" className={`nav-item ${current === page ? 'active' : ''}`} aria-current={current === page ? 'page' : undefined} onClick={() => onClick(page)}><span>{icon}</span>{children}</button>;
++}
++
++function pageTitle(page: Page) {
++  return ({ overview: 'Accueil', movements: 'Mouvements', priorities: 'Priorités', scenarios: 'Imprévus', settings: 'Plus' })[page];
++}
++
++function PageHeading({ eyebrow, title, description, month }: { eyebrow: string; title: string; description: string; month?: React.ReactNode }) {
++  return <section className="welcome-row"><div><p className="eyebrow">{eyebrow}</p><h1>{title}</h1><p className="muted">{description}</p></div>{month}</section>;
++}
++
++function MonthPicker({ month, onChange }: { month: string; onChange: (month: string) => void }) {
++  return <label className="month-picker"><span>Mois suivi</span><input type="month" value={month} onChange={(event) => onChange(event.target.value || currentMonth)} /></label>;
++}
++
++function Summary({ summary, monthTitle }: { summary: MonthlySummary | null; monthTitle: string }) {
++  return <section className="summary-grid" aria-label="Résumé du mois">
++    <article className="balance-card"><div className="balance-top"><span className="card-label">DISPONIBLE CE MOIS-CI</span><span className="balance-icon">↗</span></div><strong className="balance-amount">{summary ? formatXof(summary.availableXof) : '—'}</strong><p>Après les dépenses planifiées, hors revenus non encaissés</p><div className="balance-footer"><span className="balance-indicator"></span> Calculé côté serveur à partir de vos saisies</div></article>
++    <MetricCard label="REVENUS ENCAISSÉS" amount={summary?.incomeXof ?? null} period={monthTitle} tone="green" icon="＋" />
++    <MetricCard label="REVENUS PRÉVUS" amount={summary?.plannedIncomeXof ?? null} period={monthTitle} tone="amber" icon="◷" />
++    <MetricCard label="DÉPENSES PAYÉES" amount={summary?.expensesXof ?? null} period={monthTitle} tone="coral" icon="−" />
++    <MetricCard label="DÉPENSES PRÉVUES" amount={summary?.plannedXof ?? null} period={monthTitle} tone="amber" icon="◷" />
++  </section>;
++}
++
++function MetricCard({ label, amount, period, tone, icon }: { label: string; amount: number | null; period: string; tone: string; icon: string }) {
++  return <article className="metric-card"><div className="metric-heading"><span className={`metric-icon ${tone}`}>{icon}</span><span className="card-label">{label}</span></div><strong>{amount == null ? '—' : formatXof(amount)}</strong><small>Sur {period}</small></article>;
++}
++
++function PanelHeading({ eyebrow, title }: { eyebrow: string; title: string }) {
++  return <div className="panel-heading"><div><p className="eyebrow">{eyebrow}</p><h2>{title}</h2></div></div>;
++}
++
++function TransactionForm({ categories, items, onSubmit, disabled }: { categories: Category[]; items: FinancialItem[]; onSubmit: (event: FormEvent<HTMLFormElement>) => void; disabled: boolean }) {
++  const [kind, setKind] = useState<TransactionKind>('expense');
++  const availableCategories = categories.filter((category) => category.kind === kind);
++  return <form className="transaction-form" onSubmit={onSubmit}>
++    <fieldset disabled={disabled}>
++      <div className="type-toggle" role="group" aria-label="Type de mouvement"><button type="button" className={kind === 'expense' ? 'selected expense-selected' : ''} onClick={() => setKind('expense')}>− Dépense</button><button type="button" className={kind === 'income' ? 'selected income-selected' : ''} onClick={() => setKind('income')}>＋ Revenu</button></div>
++      <input type="hidden" name="kind" value={kind} />
++      <label className="amount-label">Montant <span>FCFA</span><div className="amount-input"><input name="amountXof" type="number" min="1" step="1" placeholder="0" required /><span>F CFA</span></div></label>
++      <div className="form-row"><label>Catégorie<select name="categoryId" required defaultValue=""><option value="" disabled>Choisir…</option>{availableCategories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select></label><label>Date<input id="transaction-date" name="occurredOn" type="date" defaultValue={today} required /></label></div>
++      <div className="form-row"><label>Bénéficiaire / source <span className="optional">Facultatif</span><input name="payee" maxLength={120} placeholder="Ex. Marché, salaire…" /></label><label>Statut<select name="status" defaultValue="paid"><option value="paid">Payé / reçu</option><option value="planned">Prévu</option><option value="deferred">Reporté</option></select></label></div>
++      <details className="extra-fields"><summary>Ajouter une note, une échéance ou un engagement <span>+</span></summary><div className="form-row extra-row"><label>Échéance<input name="dueOn" type="date" /></label><label>Note<input name="note" maxLength={500} placeholder="Un détail utile…" /></label>{kind === 'expense' && <label className="wide-field">Engagement lié<select name="financialItemId" defaultValue=""><option value="">Aucun</option>{items.filter((item) => item.status === 'active').map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}</div></details>
++      <button className="primary-button save-button" type="submit" disabled={availableCategories.length === 0}>Enregistrer le mouvement <span>→</span></button>
++    </fieldset>
++    {availableCategories.length === 0 && <p className="form-hint">Aucune catégorie disponible pour ce type de mouvement.</p>}
++    <p className="form-hint"><span>⌑</span> {disabled ? 'Connectez-vous pour enregistrer.' : 'Enregistré dans votre espace privé'}</p>
++  </form>;
++}
++
++function TransactionHistory({ transactions, monthTitle, hasMore, loadingMore, onLoadMore }: { transactions: Transaction[]; monthTitle: string; hasMore: boolean; loadingMore: boolean; onLoadMore: () => void }) {
++  return <section className="panel recent-panel"><div className="panel-heading recent-heading"><div><p className="eyebrow">VOTRE HISTORIQUE</p><h2>{monthTitle}</h2></div><span className="count-badge">{transactions.length} mouvement{transactions.length === 1 ? '' : 's'}</span></div>
++    {transactions.length === 0 ? <EmptyMessage>Ajoutez un revenu ou une dépense pour voir votre mois prendre forme.</EmptyMessage> : <ul className="transaction-list">{transactions.map((transaction) => <TransactionRow key={transaction.id} transaction={transaction} />)}</ul>}
++    {hasMore && <button className="load-more-button" onClick={onLoadMore} disabled={loadingMore}>{loadingMore ? 'Chargement…' : 'Afficher les mouvements suivants'}</button>}
++    {transactions.length > 0 && <div className="list-footer">Les totaux sont recalculés après chaque saisie.</div>}
++  </section>;
++}
++
++function TransactionRow({ transaction }: { transaction: Transaction }) {
++  const isIncome = transaction.kind === 'income';
++  const displayDate = transaction.status === 'paid' ? transaction.occurredOn : transaction.dueOn || transaction.occurredOn;
++  const dateLabel = transaction.status === 'paid' ? 'Le' : 'Échéance';
++  return <li className="transaction-row"><span className={`transaction-icon ${isIncome ? 'income-icon' : 'expense-icon'}`}>{isIncome ? '↙' : '↗'}</span><div className="transaction-detail"><strong>{transaction.payee || transaction.categoryName || 'Mouvement'}</strong><span>{transaction.categoryName} · {dateLabel} {new Intl.DateTimeFormat('fr-FR', { day: 'numeric', month: 'short', timeZone: 'Africa/Abidjan' }).format(new Date(`${displayDate}T12:00:00Z`))}</span></div><div className="transaction-amount"><strong className={isIncome ? 'income-text' : ''}>{isIncome ? '+' : '−'}{formatXof(transaction.amountXof)}</strong>{transaction.status !== 'paid' && <span className={`status-pill ${transaction.status}`}>{transaction.status === 'planned' ? 'Prévu' : 'Reporté'}</span>}</div></li>;
++}
++
++function FinancialItemForm({ onSubmit, disabled }: { onSubmit: (event: FormEvent<HTMLFormElement>) => void; disabled: boolean }) {
++  return <form className="form-content" onSubmit={onSubmit}><fieldset disabled={disabled}>
++    <label className="field-label">Nom<input name="name" maxLength={120} required placeholder="Ex. Loyer, dette, moto…" /></label>
++    <div className="form-row"><label className="field-label">Type<select name="kind" defaultValue="custom"><option value="debt">Dette</option><option value="subscription">Abonnement</option><option value="project">Projet</option><option value="custom">Autre poste</option></select></label><label className="field-label">Montant planifié<input name="plannedAmountXof" type="number" min="0" step="1" required /></label></div>
++    <div className="form-row"><label className="field-label">Montant total<input name="targetAmountXof" type="number" min="0" step="1" /></label><label className="field-label">Solde restant<input name="remainingAmountXof" type="number" min="0" step="1" /></label></div>
++    <div className="form-row"><label className="field-label">Échéance<input name="dueOn" type="date" /></label><label className="field-label">Périodicité<select name="cadence" defaultValue=""><option value="">Aucune</option><option value="once">Unique</option><option value="weekly">Hebdomadaire</option><option value="monthly">Mensuelle</option><option value="yearly">Annuelle</option></select></label></div>
++    <div className="form-row"><label className="field-label">Priorité<select name="priority" defaultValue="3">{[1, 2, 3, 4, 5].map((value) => <option key={value} value={value}>{value}/5</option>)}</select></label><label className="field-label">Conséquence du report<input name="deferralImpact" maxLength={500} placeholder="Frais, pénalité, retard…" /></label></div>
++    <button className="primary-button" disabled={disabled}>Ajouter l’engagement</button>
++  </fieldset></form>;
++}
++
++function UnexpectedEventForm({ onSubmit, disabled }: { onSubmit: (event: FormEvent<HTMLFormElement>) => void; disabled: boolean }) {
++  return <form className="form-content" onSubmit={onSubmit}><fieldset disabled={disabled}>
++    <label className="field-label">Intitulé<input name="title" maxLength={120} required placeholder="Ex. Réparation urgente" /></label>
++    <div className="form-row"><label className="field-label">Montant<input name="amountXof" type="number" min="1" step="1" required /></label><label className="field-label">Urgence<select name="urgency" defaultValue="3">{[1, 2, 3, 4, 5].map((value) => <option key={value} value={value}>{value}/5</option>)}</select></label></div>
++    <div className="form-row"><label className="field-label">Date<input name="occurredOn" type="date" defaultValue={today} required /></label><label className="field-label">Échéance<input name="dueOn" type="date" /></label></div>
++    <label className="field-label">Note (facultative)<input name="note" maxLength={500} /></label>
++    <button className="primary-button">Enregistrer l’imprévu</button>
++  </fieldset></form>;
++}
++
++function SimulationResults({ simulation, onConfirm, disabled }: { simulation: ScenarioSimulation; onConfirm: (id: string) => void; disabled: boolean }) {
++  const hasAdmissible = simulation.candidates.some((candidate) => candidate.admissible);
++  return <div className="simulation-results" aria-live="polite">
++    <div className="simulation-baseline"><span>Solde avant : <strong>{formatXof(simulation.availableBeforeXof)}</strong></span><span>Imprévu : <strong>−{formatXof(simulation.event.amountXof)}</strong></span></div>
++    {!hasAdmissible && <p className="alert error-alert">Aucune combinaison ne couvre entièrement cet imprévu. Les options ci-dessous signalent le manque; elles ne peuvent pas être confirmées.</p>}
++    <h3>Options déterministes</h3>
++    <ol className="candidate-list">{simulation.candidates.map((candidate) => <li className="candidate-card" key={candidate.id}>
++      <div className="candidate-header"><strong>{candidate.actions.length ? candidate.actions.map((action) => `${action.action} · ${action.itemName}`).join(' + ') : 'Utiliser le solde disponible'}</strong><span className={candidate.admissible ? 'covered' : 'shortfall'}>{candidate.admissible ? 'Couvrable' : `Manque ${formatXof(Math.abs(candidate.availableAfterXof))}`}</span></div>
++      <p>{candidate.explanation}</p><p className="candidate-balance">Après l’imprévu : <strong>{formatXof(candidate.availableAfterXof)}</strong></p>
++      {candidate.actions.map((action) => <p className="consequence-note" key={`${action.itemId}-${action.action}`}>{action.action} {formatXof(action.amountDeltaXof)} · {action.consequence}</p>)}
++      <button className="secondary-button" disabled={disabled || !candidate.admissible} onClick={() => onConfirm(candidate.id)}>Confirmer cette option</button>
++    </li>)}</ol>
++  </div>;
++}
++
++function EmptyMessage({ children }: { children: string }) {
++  return <div className="empty-state"><span className="empty-icon">↗</span><strong>Rien à afficher pour le moment.</strong><p>{children}</p></div>;
++}
++
++function itemKind(kind: FinancialItem['kind']) {
++  return ({ debt: 'Dette', subscription: 'Abonnement', project: 'Projet', custom: 'Autre poste' })[kind];
++}
++
++export default App;
+
+diff --git a/src/ui/styles.css b/src/ui/styles.css
+new file mode 100644
+--- /dev/null
++++ b/src/ui/styles.css
+@@ -0,0 +1,294 @@
++:root {
++  font-family: 'Segoe UI', Arial, sans-serif;
++  color: #172a24;
++  background: #f5f7f4;
++  font-synthesis: none;
++  text-rendering: optimizeLegibility;
++  -webkit-font-smoothing: antialiased;
++  font-optical-sizing: auto;
++  font-weight: 400;
++}
++
++* { box-sizing: border-box; }
++body { margin: 0; min-width: 320px; min-height: 100vh; }
++button, input, select { font: inherit; }
++button { cursor: pointer; }
++.app-shell { min-height: 100vh; }
++.sidebar { position: fixed; inset: 0 auto 0 0; width: 248px; background: #122a24; color: #e8f0e9; padding: 28px 18px 20px; display: flex; flex-direction: column; z-index: 3; }
++.brand { display: flex; align-items: center; gap: 10px; padding: 0 8px; color: #f4f8f2; text-decoration: none; font: 800 24px 'Segoe UI', Arial, sans-serif; letter-spacing: -1.2px; }
++.brand-dot { color: #b6d77c; }
++.brand-mark { width: 42px; height: 42px; display: inline-grid; place-items: center; border-radius: 14px; background: #c1df89; color: #17362a; font: 800 22px 'Segoe UI', Arial, sans-serif; box-shadow: 0 8px 24px #a5c66c24; }
++.brand-mark.small { width: 34px; height: 34px; border-radius: 11px; font-size: 18px; }
++.nav-label, .eyebrow, .card-label { letter-spacing: 1.15px; font-size: 10px; font-weight: 700; }
++.nav-label { color: #81968a; margin: 52px 10px 12px; }
++.main-nav { display: grid; gap: 6px; }
++.nav-item { display: flex; align-items: center; gap: 12px; min-height: 45px; color: #b9c9bf; text-decoration: none; padding: 0 12px; border-radius: 9px; font-size: 13px; }
++.nav-item > span { width: 20px; color: #a7bdac; font-size: 18px; text-align: center; }
++.nav-item.active { color: #f3f8f2; background: #ffffff12; box-shadow: inset 3px 0 #b8d987; }
++.nav-item.active > span { color: #c5e28f; }
++.nav-item.disabled { color: #73877b; }
++.nav-item small { margin-left: auto; font-size: 9px; border: 1px solid #53675b; border-radius: 20px; padding: 3px 6px; }
++.sidebar-bottom { margin-top: auto; }
++.private-card { border: 1px solid #ffffff1b; border-radius: 11px; padding: 13px 10px; display: flex; gap: 10px; align-items: flex-start; }
++.lock-icon { color: #bfdc8a; font-size: 18px; }
++.private-card strong, .private-card small { display: block; }
++.private-card strong { font-size: 10px; color: #e5eee6; font-weight: 600; }
++.private-card small { color: #899c90; margin-top: 5px; font-size: 9px; }
++.logout-button { border: 0; background: none; color: #aebfb4; display: flex; gap: 11px; align-items: center; padding: 18px 12px 0; font-size: 12px; }
++.logout-button span { font-size: 18px; }
++.mobile-logout { display: none; border: 0; background: transparent; color: #53675b; font-size: 10px; padding: 7px; }
++.main-content { margin-left: 248px; min-height: 100vh; }
++.topbar { height: 66px; padding: 0 5.2%; background: #fff; border-bottom: 1px solid #e8ece8; display: flex; align-items: center; justify-content: space-between; }
++.breadcrumb { color: #829087; font-size: 11px; }
++.breadcrumb span { margin: 0 9px; color: #c3cbc5; }
++.breadcrumb strong { color: #34473d; font-weight: 600; }
++.topbar-right { display: flex; align-items: center; gap: 17px; }
++.timezone-badge { border: 1px solid #e7ede5; border-radius: 30px; padding: 7px 10px; color: #6a796f; font-size: 10px; }
++.avatar { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; background: #e6efd9; color: #46603d; font: 700 12px 'Segoe UI', Arial, sans-serif; }
++.page-content { max-width: 1320px; margin: 0 auto; padding: 38px 5.2% 25px; }
++.welcome-row { display: flex; align-items: flex-end; justify-content: space-between; margin-bottom: 25px; }
++.eyebrow { color: #8a9b91; margin: 0 0 9px; }
++h1, h2, p { margin-top: 0; }
++h1, h2 { font-family: 'Segoe UI', Arial, sans-serif; letter-spacing: -1.1px; }
++.welcome-row h1 { font-size: clamp(26px, 3vw, 35px); margin: 0 0 7px; color: #183229; }
++.muted { color: #87938c; margin: 0; font-size: 12px; }
++.month-picker { display: flex; align-items: center; gap: 10px; color: #7a8a80; font-size: 10px; }
++.month-picker input { padding: 9px 10px; border: 1px solid #e0e7e1; border-radius: 8px; background: #fff; color: #33493e; font-weight: 600; font-size: 11px; }
++.summary-grid { display: grid; grid-template-columns: minmax(220px, 1.4fr) repeat(4, minmax(135px, 1fr)); gap: 13px; }
++.balance-card { background: #183b30; border-radius: 13px; padding: 21px 22px 15px; color: #fff; min-height: 157px; position: relative; overflow: hidden; }
++.balance-card:after { content: ''; position: absolute; width: 156px; height: 156px; border: 1px solid #ffffff10; border-radius: 50%; right: -70px; top: -72px; box-shadow: 0 0 0 20px #ffffff08, 0 0 0 42px #ffffff05; }
++.balance-top { display: flex; justify-content: space-between; align-items: center; }
++.balance-card .card-label { color: #b5c9b8; font-size: 9px; }
++.balance-icon { color: #cae69b; font-size: 18px; }
++.balance-amount { display: block; margin-top: 19px; font: 700 clamp(23px, 2.4vw, 31px) 'Segoe UI', Arial, sans-serif; letter-spacing: -1.3px; white-space: nowrap; }
++.balance-card p { color: #afc1b4; font-size: 10px; margin: 5px 0 16px; }
++.balance-footer { border-top: 1px solid #ffffff20; padding-top: 10px; color: #c1d1c4; font-size: 9px; display: flex; gap: 6px; align-items: center; }
++.balance-indicator { background: #bbdc82; width: 6px; height: 6px; border-radius: 50%; }
++.metric-card { background: #fff; min-height: 157px; border: 1px solid #e9eee9; border-radius: 13px; padding: 18px 17px; }
++.metric-heading { display: flex; align-items: center; gap: 8px; min-height: 24px; }
++.metric-heading .card-label { color: #839087; font-size: 8px; white-space: nowrap; }
++.metric-icon { width: 23px; height: 23px; display: grid; place-items: center; border-radius: 7px; font-size: 14px; }
++.metric-icon.green { background: #edf5e6; color: #60823c; }
++.metric-icon.coral { background: #fff0ec; color: #d17762; }
++.metric-icon.amber { background: #fff5e3; color: #bb8c36; }
++.metric-card > strong { display: block; margin-top: 21px; font: 700 clamp(14px, 1.4vw, 19px) 'Segoe UI', Arial, sans-serif; letter-spacing: -.5px; white-space: nowrap; }
++.metric-card > small { display: block; margin-top: 7px; color: #9aa59e; font-size: 9px; text-transform: capitalize; }
++.workspace-grid { display: grid; grid-template-columns: minmax(320px, .92fr) minmax(350px, 1.08fr); gap: 14px; margin-top: 18px; align-items: start; }
++.panel { background: #fff; border: 1px solid #e9eee9; border-radius: 13px; overflow: hidden; }
++.panel-heading { display: flex; justify-content: space-between; align-items: center; padding: 19px 21px 15px; border-bottom: 1px solid #eff2ef; }
++.panel-heading h2 { color: #21382d; font-size: 16px; margin: 0; letter-spacing: -.5px; }
++.panel-heading .eyebrow { margin-bottom: 5px; font-size: 8px; }
++.panel-step { color: #769054; font: 700 10px 'Segoe UI', Arial, sans-serif; }
++.panel-step i { color: #aab4ad; font-style: normal; font-weight: 500; }
++.transaction-form { padding: 16px 21px 14px; }
++.type-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; padding: 4px; background: #f2f5f1; border-radius: 9px; margin-bottom: 15px; }
++.type-toggle button { border: 0; border-radius: 7px; background: transparent; padding: 9px; color: #7b8980; font-size: 11px; font-weight: 600; }
++.type-toggle button.selected { background: #fff; box-shadow: 0 1px 5px #1a33220f; }
++.type-toggle button.expense-selected { color: #bc6758; }
++.type-toggle button.income-selected { color: #547a3c; }
++.transaction-form label { display: grid; gap: 6px; color: #58675e; font-size: 10px; font-weight: 600; }
++.amount-label { position: relative; margin-bottom: 13px; }
++.amount-label > span { position: absolute; top: 0; right: 0; color: #9aa69e; font-size: 9px; font-weight: 400; }
++.amount-input { display: flex; align-items: center; border: 1px solid #dfe7df; border-radius: 8px; height: 42px; overflow: hidden; }
++.amount-input:focus-within { border-color: #779b5a; box-shadow: 0 0 0 3px #93b37520; }
++.amount-input input { min-width: 0; flex: 1; border: 0; outline: 0; padding: 0 11px; color: #203b2e; font: 700 16px 'Segoe UI', Arial, sans-serif; }
++.amount-input > span { padding: 0 10px; border-left: 1px solid #e6ebe6; color: #8d9991; font-size: 9px; }
++.form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; margin-bottom: 12px; }
++.transaction-form input:not(.amount-input input), .transaction-form select, .login-panel input { height: 37px; border: 1px solid #e1e8e2; border-radius: 7px; background: #fff; color: #34493e; padding: 0 9px; outline: 0; font-size: 10px; font-weight: 500; }
++.transaction-form input:focus, .transaction-form select:focus, .login-panel input:focus { border-color: #829e69; box-shadow: 0 0 0 3px #93b37520; }
++.transaction-form input::placeholder { color: #b4beb7; }
++.optional { justify-self: end; margin-top: -17px; font-size: 8px; color: #a3ada6; font-weight: 400; }
++.extra-fields { border-top: 1px solid #eff2ef; padding: 11px 0; margin-bottom: 7px; }
++.extra-fields summary { list-style: none; color: #6f7d73; font-size: 10px; cursor: pointer; }
++.extra-fields summary::-webkit-details-marker { display: none; }
++.extra-fields summary span { float: right; color: #66834a; font-size: 14px; }
++.extra-fields[open] summary { margin-bottom: 12px; }
++.extra-row { margin-bottom: 0; }
++.primary-button { width: 100%; height: 42px; background: #bfdc8b; border: 0; border-radius: 8px; color: #233b2a; font-weight: 700; font-size: 11px; transition: background .16s, transform .16s; display: flex; justify-content: center; gap: 10px; align-items: center; }
++.primary-button:hover:not(:disabled) { background: #cce69e; transform: translateY(-1px); }
++.primary-button:disabled { opacity: .55; cursor: not-allowed; }
++.primary-button span { font-size: 15px; }
++.form-hint { display: flex; justify-content: center; gap: 5px; color: #9aa69e; font-size: 8px; margin: 10px 0 0; }
++.form-hint span { color: #719255; }
++.recent-heading { min-height: 75px; }
++.count-badge { padding: 6px 9px; background: #f1f5ee; border-radius: 18px; color: #6c8157; font-size: 9px; }
++.empty-state { min-height: 260px; padding: 38px 36px; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
++.empty-icon { display: grid; place-items: center; width: 47px; height: 47px; border-radius: 15px; background: #eff5e8; color: #7e9d59; font-size: 22px; margin-bottom: 14px; }
++.empty-state strong { color: #35493e; font: 700 13px 'Segoe UI', Arial, sans-serif; }
++.empty-state p { max-width: 260px; color: #98a39c; font-size: 10px; line-height: 1.7; margin: 7px 0 0; }
++.transaction-list { list-style: none; padding: 0; margin: 0; }
++.transaction-row { padding: 13px 18px; border-bottom: 1px solid #f0f3f0; display: flex; align-items: center; gap: 11px; }
++.transaction-icon { width: 32px; height: 32px; border-radius: 10px; display: grid; place-items: center; font-size: 14px; }
++.expense-icon { color: #bd7868; background: #fff1ed; }
++.income-icon { color: #658648; background: #eff5e8; }
++.transaction-detail { display: grid; gap: 4px; min-width: 0; }
++.transaction-detail strong { color: #34473c; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
++.transaction-detail span { color: #98a39c; font-size: 8px; }
++.transaction-amount { display: grid; justify-items: end; gap: 4px; margin-left: auto; white-space: nowrap; }
++.transaction-amount strong { color: #b96557; font: 700 10px 'Segoe UI', Arial, sans-serif; }
++.transaction-amount strong.income-text { color: #628145; }
++.status-pill { font-size: 8px; padding: 2px 6px; border-radius: 10px; background: #fff5e4; color: #a57c35; }
++.status-pill.deferred { background: #f2eef9; color: #8068a0; }
++.list-footer { padding: 12px 18px; text-align: center; color: #9aa59e; font-size: 8px; }
++.page-footer { display: flex; justify-content: space-between; color: #9ca79f; padding: 20px 2px; font-size: 9px; }
++.page-footer b { color: #bdc9bf; padding: 0 4px; }
++.alert { border-radius: 8px; padding: 11px 13px; margin: -7px 0 17px; font-size: 11px; }
++.error-alert, .form-error { background: #fff0ed; color: #a84234; }
++.success-alert { background: #edf5e6; color: #476d36; }
++.login-layout { display: grid; grid-template-columns: minmax(300px, 1.05fr) minmax(380px, .95fr); min-height: 100vh; background: #fff; }
++.login-story { position: relative; overflow: hidden; background: #16392e; padding: clamp(35px, 7vw, 95px); color: #fff; display: flex; flex-direction: column; justify-content: center; }
++.login-story:after { content: ''; position: absolute; width: 420px; height: 420px; border: 1px solid #ffffff14; border-radius: 50%; right: -200px; bottom: -180px; box-shadow: 0 0 0 44px #ffffff08, 0 0 0 90px #ffffff05; }
++.login-story .brand-mark { margin-bottom: 58px; }
++.login-story .eyebrow { color: #bed88e; }
++.login-story h1 { max-width: 500px; font-size: clamp(35px, 5vw, 57px); line-height: 1.13; margin-bottom: 17px; }
++.login-story .muted { max-width: 380px; color: #bfd0c3; line-height: 1.8; }
++.login-note { margin-top: 42px; color: #dae6da; font-size: 11px; }
++.login-note span { color: #bfdf88; margin-right: 7px; }
++.login-panel { align-self: center; width: min(390px, calc(100% - 60px)); justify-self: center; padding: 45px 0; }
++.form-heading h2 { font-size: 28px; margin-bottom: 7px; }
++.form-heading { margin-bottom: 28px; }
++.stack-form { display: grid; gap: 16px; }
++.stack-form label { display: grid; gap: 7px; color: #53645a; font-size: 11px; font-weight: 600; }
++.login-panel input { height: 44px; font-size: 12px; padding: 0 12px; }
++.stack-form .primary-button { margin-top: 5px; height: 47px; }
++.privacy-caption { color: #9ba69f; font-size: 9px; text-align: center; margin-top: 21px; }
++.form-error { padding: 10px; border-radius: 7px; font-size: 10px; margin: 0; }
++.loading-screen { min-height: 100vh; display: grid; place-content: center; justify-items: center; gap: 14px; color: #7c8b81; font-size: 12px; }
++.retry-button { width: auto; min-width: 150px; padding: 0 16px; }
++.load-more-button { display: block; width: calc(100% - 32px); margin: 14px auto; border: 1px solid #e1e9dd; border-radius: 7px; background: #f8faf6; color: #5e764a; padding: 9px; font-size: 10px; font-weight: 600; }
++.load-more-button:disabled { opacity: .6; cursor: wait; }
++.main-nav .nav-item { border: 0; width: 100%; text-align: left; background: transparent; cursor: pointer; font-family: inherit; }
++.connection-badge { border-radius: 30px; padding: 6px 9px; font-size: 9px; }
++.connection-badge.online { background: #edf5e6; color: #52723e; }
++.connection-badge.offline { background: #fff0ed; color: #a84234; }
++.offline-alert { background: #fff7e6; color: #80622d; }
++.planning-grid, .settings-grid { display: grid; grid-template-columns: minmax(280px, .82fr) minmax(350px, 1.18fr); gap: 14px; align-items: start; margin-top: 18px; }
++.scenario-grid { grid-template-columns: minmax(280px, .8fr) minmax(360px, 1.2fr); }
++.settings-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++.settings-card { min-height: 190px; }
++.settings-body { padding: 18px 21px; color: #6f7d73; font-size: 11px; line-height: 1.7; }
++.settings-body p { margin: 0 0 12px; }
++.settings-body strong { color: #34473c; }
++.pwa-note { padding: 10px 12px; border-radius: 8px; background: #f3f6f1; color: #718071; font-size: 10px; }
++.form-content { padding: 17px 21px 20px; }
++.form-content fieldset, .transaction-form fieldset { display: grid; min-width: 0; padding: 0; margin: 0; border: 0; gap: 12px; }
++.field-label, .compact-form label { display: grid; gap: 6px; color: #58675e; font-size: 10px; font-weight: 600; }
++.field-label input, .field-label select, .compact-form input, .compact-form select, .form-content select { width: 100%; min-width: 0; height: 38px; border: 1px solid #e1e8e2; border-radius: 7px; background: #fff; color: #34493e; padding: 0 9px; outline: 0; font-size: 10px; font-weight: 500; }
++.field-label input:focus, .field-label select:focus, .compact-form input:focus, .compact-form select:focus { border-color: #829e69; box-shadow: 0 0 0 3px #93b37520; }
++.form-content .form-row { margin-bottom: 0; }
++.form-content .primary-button { margin-top: 4px; }
++.planning-list { list-style: none; padding: 0; margin: 0; }
++.planning-card { padding: 16px 19px; border-bottom: 1px solid #f0f3f0; }
++.planning-card-heading { display: flex; justify-content: space-between; gap: 10px; align-items: center; }
++.planning-card-heading > div { display: grid; gap: 4px; }
++.planning-card-heading strong { color: #34473c; font-size: 12px; }
++.kind-label, .source-label { color: #8a9b91; font-size: 9px; text-transform: uppercase; letter-spacing: .5px; }
++.planning-meta { color: #839087; font-size: 9px; margin: 8px 0 0; }
++.consequence-note { color: #8e7750; font-size: 9px; line-height: 1.5; margin: 8px 0; }
++.edit-details { border-top: 1px solid #f0f3f0; margin-top: 12px; padding-top: 10px; }
++.edit-details summary { color: #66834a; cursor: pointer; font-size: 10px; font-weight: 600; }
++.compact-form { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
++.wide-field { grid-column: 1 / -1; }
++.secondary-button { width: 100%; min-height: 39px; border: 1px solid #dfe8d8; border-radius: 8px; background: #f5f8f2; color: #587344; font-size: 10px; font-weight: 700; padding: 8px 12px; }
++.secondary-button:hover:not(:disabled) { background: #edf4e7; }
++.secondary-button:disabled, .text-button:disabled { opacity: .55; cursor: not-allowed; }
++.text-button { border: 0; background: transparent; color: #73884e; font-size: 9px; cursor: pointer; }
++.delete-button { color: #a65447; text-align: left; }
++.form-content > .field-label { margin-bottom: 12px; }
++.form-content > .secondary-button { margin-top: 14px; }
++.event-list { display: grid; gap: 8px; margin: 13px 0; }
++.event-summary { border: 1px solid #edf1ec; border-radius: 8px; padding: 9px 10px; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
++.event-summary div { display: grid; gap: 4px; min-width: 0; }
++.event-summary strong { color: #34473c; font-size: 10px; }
++.event-summary span { color: #87938c; font-size: 9px; }
++.simulation-results { border-top: 1px solid #eff2ef; margin-top: 17px; padding-top: 15px; }
++.simulation-baseline { display: flex; justify-content: space-between; gap: 10px; color: #718071; font-size: 9px; }
++.simulation-baseline strong { color: #34473c; }
++.simulation-results h3 { margin: 15px 0 9px; font-size: 12px; color: #34473c; }
++.candidate-list, .recommendation-list { display: grid; gap: 9px; list-style: none; padding: 0; margin: 0; }
++.candidate-card { border: 1px solid #e9eee9; border-radius: 9px; padding: 12px; }
++.candidate-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
++.candidate-header > strong { color: #35493e; font-size: 10px; }
++.covered, .shortfall { flex: 0 0 auto; border-radius: 20px; padding: 4px 7px; font-size: 8px; }
++.covered { background: #edf5e6; color: #54733c; }
++.shortfall { background: #fff0ed; color: #a84234; }
++.candidate-card > p:not(.consequence-note) { color: #859189; font-size: 9px; line-height: 1.5; margin: 8px 0; }
++.candidate-card .candidate-balance { color: #53665b; }
++.candidate-balance strong { color: #284b35; }
++.candidate-card .secondary-button { margin-top: 8px; }
++.recommendation-control { border-top: 1px solid #eff2ef; margin-top: 17px; padding-top: 15px; }
++.toggle-row { display: flex; align-items: center; gap: 8px; color: #56685d; font-size: 10px; }
++.toggle-row input { accent-color: #66834a; }
++.left-hint { justify-content: flex-start; text-align: left; line-height: 1.5; }
++.recommendation-control .secondary-button { margin-top: 10px; }
++.recommendation-list { margin-top: 12px; }
++.recommendation-list li { display: grid; gap: 5px; padding: 10px; background: #f7f9f5; border-radius: 8px; }
++.recommendation-list strong { font-size: 10px; color: #405642; }
++.recommendation-list span, .recommendation-list small { font-size: 9px; color: #78867d; }
++.source-label { margin: 10px 0 0; text-transform: none; }
++.status-pill.active { background: #edf5e6; color: #54733c; }
++.status-pill.paused, .status-pill.cancelled { background: #f3eff8; color: #8068a0; }
++.status-pill.completed { background: #edf2f2; color: #617875; }
++
++@media (max-width: 1050px) {
++  .sidebar { width: 215px; }
++  .main-content { margin-left: 215px; }
++  .page-content { padding-inline: 3.5%; }
++  .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
++  .balance-card { grid-row: span 1; }
++  .workspace-grid { grid-template-columns: 1fr; }
++  .planning-grid, .scenario-grid { grid-template-columns: 1fr; }
++}
++
++@media (max-width: 700px) {
++  .sidebar { position: static; width: auto; height: 58px; padding: 0 16px; flex-direction: row; align-items: center; }
++  .brand { font-size: 20px; }
++  .brand-mark.small { width: 30px; height: 30px; font-size: 16px; }
++  .nav-label, .sidebar-bottom { display: none; }
++  .main-nav { position: fixed; z-index: 4; left: 0; right: 0; bottom: 0; display: flex; justify-content: space-around; gap: 0; padding: 5px 4px calc(5px + env(safe-area-inset-bottom)); background: #fff; border-top: 1px solid #e7ece7; box-shadow: 0 -4px 16px #16392e0a; }
++  .main-nav .nav-item { display: grid; flex: 1; justify-items: center; align-content: center; gap: 2px; min-height: 49px; padding: 4px 2px; border-radius: 7px; color: #718071; font-size: 8px; text-align: center; }
++  .main-nav .nav-item > span { width: auto; font-size: 16px; }
++  .main-nav .nav-item.active { color: #284b35; background: #f3f7ef; box-shadow: none; }
++  .mobile-logout { display: inline-block; }
++  .main-content { margin-left: 0; }
++  .topbar { height: 52px; padding: 0 17px; }
++  .timezone-badge { font-size: 8px; padding: 6px 8px; }
++  .topbar-right { gap: 9px; }
++  .page-content { padding: 27px 15px calc(85px + env(safe-area-inset-bottom)); }
++  .welcome-row { align-items: flex-start; gap: 12px; flex-direction: column; margin-bottom: 19px; }
++  .welcome-row h1 { font-size: 28px; }
++  .month-picker { align-self: flex-end; }
++  .summary-grid { grid-template-columns: 1fr 1fr; gap: 9px; }
++  .balance-card { grid-column: 1 / -1; min-height: 155px; padding: 19px; }
++  .balance-amount { font-size: 28px; }
++  .metric-card { min-height: 120px; padding: 13px 11px; }
++  .metric-heading { align-items: flex-start; gap: 5px; }
++  .metric-icon { width: 20px; height: 20px; font-size: 12px; flex: 0 0 auto; }
++  .metric-heading .card-label { font-size: 7px; white-space: normal; line-height: 1.3; }
++  .metric-card > strong { font-size: 14px; margin-top: 17px; }
++  .metric-card > small { font-size: 8px; }
++  .workspace-grid { margin-top: 12px; gap: 12px; }
++  .panel-heading { padding: 16px 15px 13px; }
++  .transaction-form { padding: 14px 15px; }
++  .form-row { gap: 8px; }
++  .recent-heading { min-height: 69px; }
++  .count-badge { font-size: 8px; padding: 5px 7px; }
++  .empty-state { min-height: 205px; padding: 28px 20px; }
++  .page-footer { gap: 8px; flex-direction: column; font-size: 8px; }
++  .settings-grid { grid-template-columns: 1fr; }
++  .form-content { padding: 14px 15px 16px; }
++  .planning-card { padding: 14px 15px; }
++  .candidate-header { flex-direction: column; }
++  .simulation-baseline { flex-direction: column; }
++  .login-layout { grid-template-columns: 1fr; }
++  .login-story { min-height: 300px; padding: 27px 25px; }
++  .login-story .brand-mark { margin-bottom: 32px; width: 36px; height: 36px; }
++  .login-story h1 { font-size: 33px; margin-bottom: 11px; }
++  .login-story .muted { font-size: 10px; }
++  .login-note { margin-top: 20px; font-size: 9px; }
++  .login-panel { padding: 34px 0 45px; }
++}
++
++@media (prefers-reduced-motion: reduce) {
++  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; }
++}
+
+diff --git a/src/main.tsx b/src/main.tsx
+new file mode 100644
+--- /dev/null
++++ b/src/main.tsx
+@@ -0,0 +1,16 @@
++import React from 'react';
++import ReactDOM from 'react-dom/client';
++import App from './ui/App';
++import './ui/styles.css';
++
++ReactDOM.createRoot(document.getElementById('root')!).render(
++  <React.StrictMode>
++    <App />
++  </React.StrictMode>,
++);
++
++if ('serviceWorker' in navigator && !['localhost', '127.0.0.1'].includes(window.location.hostname)) {
++  window.addEventListener('load', () => {
++    void navigator.serviceWorker.register('/sw.js');
++  });
++}
+
+diff --git a/index.html b/index.html
+new file mode 100644
+--- /dev/null
++++ b/index.html
+@@ -0,0 +1,18 @@
++<!doctype html>
++<html lang="fr">
++  <head>
++    <meta charset="UTF-8" />
++    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
++    <meta name="theme-color" content="#122a24" />
++    <meta name="description" content="Votre budget personnel, clair et privé." />
++    <meta name="apple-mobile-web-app-capable" content="yes" />
++    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
++    <link rel="manifest" href="/manifest.webmanifest" />
++    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
++    <title>Budget — Votre mois en clair</title>
++  </head>
++  <body>
++    <div id="root"></div>
++    <script type="module" src="/src/main.tsx"></script>
++  </body>
++</html>
+
+diff --git a/public/manifest.webmanifest b/public/manifest.webmanifest
+new file mode 100644
+--- /dev/null
++++ b/public/manifest.webmanifest
+@@ -0,0 +1,19 @@
++{
++  "name": "Budget personnel",
++  "short_name": "Budget",
++  "description": "Suivi privé des revenus, dépenses et priorités en XOF.",
++  "lang": "fr",
++  "start_url": "/",
++  "scope": "/",
++  "display": "standalone",
++  "background_color": "#f5f7f4",
++  "theme_color": "#122a24",
++  "icons": [
++    {
++      "src": "/icon.svg",
++      "sizes": "any",
++      "type": "image/svg+xml",
++      "purpose": "any maskable"
++    }
++  ]
++}
+
+diff --git a/public/icon.svg b/public/icon.svg
+new file mode 100644
+--- /dev/null
++++ b/public/icon.svg
+@@ -0,0 +1,4 @@
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
++  <rect width="64" height="64" rx="18" fill="#c1df89"/>
++  <path d="M37 12H25c-8 0-13 5-13 13v14c0 8 5 13 13 13h12c9 0 15-6 15-15s-6-15-15-15h-9v9h9c4 0 6 2 6 6s-2 6-6 6H25c-3 0-4-1-4-4V25c0-3 1-4 4-4h12z" fill="#17362a"/>
++</svg>
+
+diff --git a/public/sw.js b/public/sw.js
+new file mode 100644
+--- /dev/null
++++ b/public/sw.js
+@@ -0,0 +1,37 @@
++const CACHE = 'budget-shell-v1';
++const SHELL = ['/', '/index.html', '/manifest.webmanifest', '/icon.svg'];
++
++self.addEventListener('install', (event) => {
++  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)));
++  self.skipWaiting();
++});
++
++self.addEventListener('activate', (event) => {
++  event.waitUntil(
++    caches.keys().then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key)))),
++  );
++  self.clients.claim();
++});
++
++self.addEventListener('fetch', (event) => {
++  const request = event.request;
++  const url = new URL(request.url);
++  if (request.method !== 'GET' || url.origin !== self.location.origin) return;
++  if (url.pathname === '/api' || url.pathname.startsWith('/api/')) {
++    event.respondWith(fetch(request));
++    return;
++  }
++  if (request.mode === 'navigate') {
++    event.respondWith(fetch(request).catch(() => caches.match('/')));
++    return;
++  }
++  if (url.pathname.startsWith('/assets/')) {
++    event.respondWith(caches.open(CACHE).then(async (cache) => {
++      const cached = await cache.match(request);
++      if (cached) return cached;
++      const response = await fetch(request);
++      if (response.ok && response.type === 'basic') await cache.put(request, response.clone());
++      return response;
++    }));
++  }
++});
+
+diff --git a/README.md b/README.md
+new file mode 100644
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,60 @@
++# Budget
++
++Application personnelle de suivi mensuel des revenus et dépenses en XOF, conçue pour le téléphone et l’ordinateur.
++
++## Développement local
++
++Prérequis : Node.js 24 LTS et npm.
++
++```powershell
++npm install
++npm run dev:all
++```
++
++Ouvrir l’URL Vite affichée dans le terminal. L’API locale écoute sur `http://127.0.0.1:3000` et le frontend relaie `/api` vers cette API.
++
++## PostgreSQL et premier compte
++
++1. Créer une base PostgreSQL managée (Neon via Vercel Marketplace est prévu).
++2. Appliquer les migrations dans l’ordre : `db/migrations/001_initial.sql`, puis `db/migrations/002_financial_planning.sql`. Ne pas réexécuter une migration déjà appliquée.
++3. Dans une fenêtre PowerShell, fournir l’URL de connexion sans l’ajouter au dépôt :
++
++   ```powershell
++   $env:DATABASE_URL = "postgresql://..."
++   npm run owner:create
++   ```
++
++4. Saisir l’adresse courriel et un nouveau mot de passe lorsqu’ils sont demandés. La commande refuse de créer un second compte et n’affiche ni n’écrit le mot de passe.
++5. Pour effacer la variable de la session PowerShell après la création :
++
++   ```powershell
++   Remove-Item Env:DATABASE_URL
++   ```
++
++Le compte propriétaire est créé uniquement par cette commande d’administration. La page de connexion ne permet pas une inscription publique. Sans `DATABASE_URL`, les tests et le build restent exécutables, mais les parcours authentifiés nécessitent une base configurée.
++
++## Engagements et arbitrages
++
++- Les dettes, abonnements, projets et postes personnalisés sont des engagements planifiés distincts des mouvements réellement payés. Une dépense peut être liée à un engagement; les paiements liés sont déduits des montants planifiés pour éviter un double comptage.
++- Les imprévus se simulent sans modifier les données financières. Les options non couvrables affichent le déficit et ne peuvent pas être confirmées. La confirmation verrouille et vérifie les versions, enregistre le scénario et ses actions dans une seule instruction atomique et exige une clé idempotente.
++- Groq est facultatif. Définir `GROQ_API_KEY` uniquement dans l’environnement serveur. La demande n’envoie ni note, ni bénéficiaire, ni historique brut, ni identifiant d’engagement; les règles déterministes restent disponibles si Groq est désactivé, limité, indisponible ou renvoie une réponse invalide.
++- L’export JSON est privé et exige une confirmation dans l’interface. Aucun endpoint de suppression automatique du compte n’est proposé; une demande est traitée manuellement avant la mise en production.
++- La PWA ne met en cache que le shell et les ressources statiques. Les routes `/api`, sessions, exports et données financières ne sont jamais mises en cache. Les mutations sont désactivées hors connexion.
++
++## Vérifications
++
++```powershell
++npm run build
++npm test
++npm audit --omit=dev --audit-level=high
++```
++
++## Déploiement Vercel
++
++- Connecter le dépôt à Vercel et provisionner PostgreSQL via Marketplace.
++- Configurer les valeurs de connexion fournies par le fournisseur uniquement dans les variables serveur Vercel.
++- Appliquer les migrations avant d’exposer l’application et lancer `npm run owner:create` une seule fois depuis un terminal privé connecté à la base de production choisie.
++- Déployer une Preview privée avant Production et utiliser une base distincte pour Preview.
++- La seule variable propre à Groq est `GROQ_API_KEY`; elle ne sera nécessaire qu’à l’intégration des recommandations, pas pour le suivi des transactions.
++
++Ne jamais placer de mot de passe, d’URL de base réelle ou de clé Groq dans Git, les fichiers de migration ou le bundle navigateur. Les montants sont des francs CFA XOF entiers et les mois sont interprétés selon `Africa/Abidjan` (GMT+0).
+
+diff --git a/.env.example b/.env.example
+new file mode 100644
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,6 @@
++# Fournies par l'intégration PostgreSQL hébergée (distinctes de Groq)
++DATABASE_URL=
++
++# Facultatif : clé Groq serveur pour le classement de recommandations.
++# Ne jamais exposer cette variable dans le client ou dans un fichier versionné avec sa valeur.
++GROQ_API_KEY=
